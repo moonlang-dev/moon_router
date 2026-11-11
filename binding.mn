@@ -1,0 +1,332 @@
+// moon_router.binding — reading a request body back, with the validation
+// rules a handler would otherwise write per field.
+//
+// This is the half of a framework that is merely tedious: a body is text, a
+// handler wants a typed field out of it, and the answer for a missing field, a
+// null one, and a present-but-wrong-typed one has to be the same everywhere or
+// clients see three different stories. Hono's validator and Go's
+// `ShouldBindJSON` are the same code; so was 160 lines of the one application
+// this package was extracted from, none of which mentioned its domain.
+//
+// Every failure is `err.VALIDATION_ERROR(envelope.field_message(msg, field))`,
+// so the offending field rides the U+0001 channel `envelope.split_field` takes
+// it back out of, and comes out at whatever error body the application
+// installed. That is what lets binding be package-level while the wire shape
+// stays the application's.
+//
+// The shared conventions, stated once:
+//
+//   - an absent field is the caller's `fallback` (or `""`/`[]`/`none`), not an
+//     error: a PATCH sends the fields it changes;
+//   - `Json.Null` reads as absent, because that is what a client that
+//     serializes an unset optional emits;
+//   - a present field of the wrong type is a bad request, because the client
+//     meant to send it and got it wrong.
+
+use envelope
+use std.json.Json
+
+/// A request body as a JSON object.
+///
+/// Anything that is not an object — a bare number, an array, a truncated
+/// document — is one answer, because a client that sent any of them made the
+/// same mistake. An empty body is an empty object, which is what a POST with
+/// no fields means.
+///
+/// - `body`: Raw request body text; an empty body reads as an empty object.
+///
+/// ```moon
+/// use moon_router.binding
+/// use std.json.Json
+///
+/// struct Update { title: string, tags: [string] }
+///
+/// fn main() {
+///   let body = binding.json_body(
+///     "{\"title\":\"moon\",\"zoom\":2,\"active\":true,\"ids\":[1,2]}",
+///   ).unwrap()
+///   println(binding.require_non_empty(binding.string_field(body, "title").unwrap(), "title"))
+///   println(binding.number_field(body, "zoom", 1.0))
+///   println(binding.bool_field(body, "active", false))
+///   println(binding.int_array_field(body, "ids"))
+///   println(binding.require_range(2.0, 1.0, 10.0, "zoom"))
+///   println(binding.strict_int("42"))
+///   println(binding.require_strict_int("42", "invalid id", "id"))
+///   println(binding.typed_body<Update>("{\"title\":\"moon\",\"tags\":[]}"))
+/// }
+/// ```
+pub fn json_body(body: string) -> Result<{string: Json}, Error> {
+    let trimmed = body.trim_ascii()
+    if trimmed == "" {
+        return ok({:})
+    }
+    match std.json.parse(trimmed) {
+        ok(value) => match value {
+            Json.Obj(fields) => ok(fields),
+            Json.Null => ok({:}),
+            _ => invalid_body(),
+        },
+        err(_) => invalid_body(),
+    }
+}
+
+/// The one answer a malformed body gets, named so a route that reads a body
+/// some other way can give the same one.
+pub fn invalid_body() -> Result<{string: Json}, Error> {
+    err.VALIDATION_ERROR(envelope.field_message("Invalid JSON", "body"))
+}
+
+/// A request body as a `T`, decoded by its codec.
+///
+/// The fourteen extractors below are for a body whose shape is genuinely
+/// dynamic. A body with a *known* shape should declare a struct and come
+/// through here instead of calling six of them in a row, each re-stating a
+/// field's name, its type, and what counts as a bad value for it.
+///
+/// A decode failure is the same `VALIDATION_ERROR` envelope the hand-written
+/// path produces, so a client cannot tell which route read its body which way.
+/// The codec's message names the JSON path it failed at
+/// (`decode: expected string at $.tags[3].name, found int`), and that is what
+/// rides the field channel — strictly more than `"Invalid JSON"` says, and in
+/// the same place.
+///
+/// - `body`: Raw request body text, decoded by `T`'s codec.
+pub fn typed_body<T>(body: string) -> Result<T, Error> {
+    let trimmed = body.trim_ascii()
+    let text = if trimmed == "" {
+        "{}"
+    } else {
+        trimmed
+    }
+    match std.json.decode<T>(text) {
+        ok(value) => ok(value),
+        err(failure) => err.VALIDATION_ERROR(envelope.field_message(failure.message, "body")),
+    }
+}
+
+/// A string field, or "" when absent. A present field of the wrong type is a
+/// bad request rather than a missing one — the client meant to send it.
+///
+/// - `body`: The decoded request body object.
+/// - `key`: Field name to read.
+pub fn string_field(body: {string: Json}, key: string) -> Result<string, Error> {
+    if !body.has(key) {
+        return ok("")
+    }
+    match body[key] {
+        Json.Str(value) => ok(value),
+        Json.Null => ok(""),
+        _ => err.VALIDATION_ERROR(envelope.field_message("Invalid JSON", "body")),
+    }
+}
+
+/// A number field as a float. JSON has one number type; the distinction
+/// between 3 and 3.0 is a spelling, not a meaning.
+///
+/// - `body`: The decoded request body object.
+/// - `key`: Field name to read.
+/// - `fallback`: Value used when the field is absent.
+pub fn number_field(body: {string: Json}, key: string, fallback: float) -> Result<float, Error> {
+    if !body.has(key) {
+        return ok(fallback)
+    }
+    match body[key] {
+        Json.Int(value) => ok((value) as float),
+        Json.Float(value) => ok(value),
+        Json.Null => ok(fallback),
+        _ => err.VALIDATION_ERROR(envelope.field_message("Invalid JSON", "body")),
+    }
+}
+
+/// A number field that may genuinely be absent, which is different from being
+/// zero: an unsent `zoomLevel` leaves the stored one alone.
+///
+/// - `body`: The decoded request body object.
+/// - `key`: Field name to read.
+pub fn optional_number_field(body: {string: Json}, key: string) -> Result<Optional<float>, Error> {
+    if !body.has(key) {
+        return ok(none)
+    }
+    match body[key] {
+        Json.Int(value) => ok(some((value) as float)),
+        Json.Float(value) => ok(some(value)),
+        Json.Null => ok(none),
+        _ => err.VALIDATION_ERROR(envelope.field_message("Invalid JSON", "body")),
+    }
+}
+
+/// Reads an optional Boolean field from a JSON object.
+///
+/// - `body`: The decoded request body object.
+/// - `key`: Field name to read.
+/// - `fallback`: Value used when the field is absent.
+pub fn bool_field(body: {string: Json}, key: string, fallback: bool) -> Result<bool, Error> {
+    if !body.has(key) {
+        return ok(fallback)
+    }
+    match body[key] {
+        Json.Bool(value) => ok(value),
+        Json.Null => ok(fallback),
+        _ => err.VALIDATION_ERROR(envelope.field_message("Invalid JSON", "body")),
+    }
+}
+
+/// Reads an optional integer field from a JSON object.
+///
+/// - `body`: The decoded request body object.
+/// - `key`: Field name to read.
+/// - `fallback`: Value used when the field is absent.
+pub fn int_field(body: {string: Json}, key: string, fallback: int) -> Result<int, Error> {
+    if !body.has(key) {
+        return ok(fallback)
+    }
+    match body[key] {
+        Json.Int(value) => ok(value as int),
+        Json.Null => ok(fallback),
+        _ => err.VALIDATION_ERROR(envelope.field_message("Invalid JSON", "body")),
+    }
+}
+
+/// A field that must be an array of integers — a list of ids. Absent and null
+/// are `none`, which a caller distinguishes from an empty array meaning
+/// "clear the list".
+///
+/// - `body`: The decoded request body object.
+/// - `key`: Field name to read.
+pub fn int_array_field(body: {string: Json}, key: string) -> Result<Optional<[int]>, Error> {
+    if !body.has(key) {
+        return ok(none)
+    }
+    match body[key] {
+        Json.Null => ok(none),
+        Json.Arr(items) => {
+            let mut out: [int] = []
+            for item in items {
+                match item {
+                    Json.Int(value) => out.push(value as int),
+                    _ => {
+                        return err.VALIDATION_ERROR(envelope.field_message("Invalid JSON", "body"))
+                    },
+                }
+            }
+            ok(some(out))
+        },
+        _ => err.VALIDATION_ERROR(envelope.field_message("Invalid JSON", "body")),
+    }
+}
+
+/// Reads a required string-array field from a JSON object.
+///
+/// - `body`: The decoded request body object.
+/// - `key`: Field name to read.
+pub fn string_array_field(body: {string: Json}, key: string) -> Result<[string], Error> {
+    if !body.has(key) {
+        return ok([])
+    }
+    match body[key] {
+        Json.Null => ok([]),
+        Json.Arr(items) => {
+            let mut out: [string] = []
+            for item in items {
+                match item {
+                    Json.Str(value) => out.push(value),
+                    _ => {
+                        return err.VALIDATION_ERROR(envelope.field_message("Invalid JSON", "body"))
+                    },
+                }
+            }
+            ok(out)
+        },
+        _ => err.VALIDATION_ERROR(envelope.field_message("Invalid JSON", "body")),
+    }
+}
+
+/// Refuses a value outside its range, naming the field so a UI can point at
+/// the input that is wrong rather than at the form.
+///
+/// - `value`: Value to check.
+/// - `low`: Lowest value accepted.
+/// - `high`: Highest value accepted.
+/// - `field`: Field name carried in the validation error.
+pub fn require_range(value: float, low: float, high: float, field: string) -> Result<int, Error> {
+    if value < low || value > high {
+        return err.VALIDATION_ERROR(envelope.field_message(
+            field + " must be between " + number_text(low) + " and " + number_text(high),
+            field,
+        ))
+    }
+    ok(0)
+}
+
+/// A bound as the message spells it. `to_string` already prints an integral
+/// float without a decimal point, which is what interpolating a JavaScript
+/// number does.
+///
+/// - `value`: Bound to render into a message.
+pub fn number_text(value: float) -> string {
+    to_string(value)
+}
+
+/// Rejects an empty field value with a validation error.
+///
+/// - `value`: Field value to check.
+/// - `field`: Field name carried in the validation error.
+pub fn require_non_empty(value: string, field: string) -> Result<string, Error> {
+    if value == "" {
+        return err.VALIDATION_ERROR(envelope.field_message(field + " is required", field))
+    }
+    ok(value)
+}
+
+// ------------------------------------------------------------ strict ints
+
+/// An optional sign and digits, and nothing else — no whitespace, no decimal
+/// point, no empty value. `none` when the text is not exactly an integer.
+///
+/// Stricter than a permissive parse on purpose, and the strictness is not any
+/// one language's: `strconv.Atoi`, Rust's `str::parse` and JavaScript's
+/// `Number()` all refuse the same texts. `" 12"` and `"12abc"` are not twelve,
+/// and reading them as twelve is how a typo in a URL silently operates on the
+/// wrong row.
+///
+/// - `value`: Text that must be exactly an optional sign followed by digits.
+pub fn strict_int(value: string) -> Optional<int> {
+    if !is_strict_integer(value) {
+        return none
+    }
+    match std.strings.parse_int(value) {
+        ok(parsed) => some(parsed),
+        err(_) => none,
+    }
+}
+
+/// `strict_int` where a bad value is a 400 naming the field, rather than a
+/// silent absence — the shape a path segment wants, since `/tags/{id}` with a
+/// malformed id names no row at all.
+///
+/// - `value`: Text that must be exactly an optional sign followed by digits.
+/// - `message`: Message carried in the validation error.
+/// - `field`: Field name carried in the validation error.
+pub fn require_strict_int(value: string, message: string, field: string) -> Result<int, Error> {
+    match strict_int(value) {
+        some(parsed) => ok(parsed),
+        none => err.VALIDATION_ERROR(envelope.field_message(message, field)),
+    }
+}
+
+fn is_strict_integer(value: string) -> bool {
+    let body = if value.starts_with("+") || value.starts_with("-") {
+        value.slice(1, value.len())
+    } else {
+        value
+    }
+    if body == "" {
+        return false
+    }
+    for byte in std.strings.bytes(body) {
+        if byte < 48 || byte > 57 {
+            return false
+        }
+    }
+    true
+}

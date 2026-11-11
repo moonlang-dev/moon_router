@@ -1,0 +1,241 @@
+// moon_router.multipart — the two shapes a route wants over a multipart body.
+//
+// `std.http_server` already parses multipart incrementally and retains only a
+// small boundary window, so nothing here re-implements a parser. What it adds
+// is the pair of shapes a handler actually reaches for: a part streamed
+// straight to a sink, and a small part read into memory.
+//
+// The size rule is the reason this is a module rather than four lines at each
+// call site. A part that is *meant* to be small is read with a ceiling, so a
+// truncated or hostile upload cannot turn a form field into a gigabyte of
+// resident memory — and a ceiling that has to be remembered at every call site
+// is one that will be forgotten at one of them.
+
+use moon_router.envelope
+use std.http_server
+
+use std.http_server.MultipartPart
+use std.http_server.Request
+use std.image
+
+/// How much of a small part is read before it is refused.
+///
+/// Generous for what these fields actually carry — a filename, a tag id list, a
+/// preview config object — and far below anything that would matter, which is
+/// the point: a field with no ceiling is a way to exhaust memory over a form
+/// that looks ordinary.
+pub const MAX_FIELD_BYTES: int = 1048576
+
+/// How much is pulled from the socket at a time.
+pub const CHUNK_BYTES: int = 262144
+
+/// How much of a whole small upload — a thumbnail, a sprite sheet, an I-frame
+/// manifest — is read before it is refused.
+pub const MAX_UPLOAD_BYTES: int = 268435456
+
+/// One part read fully into memory.
+pub struct BufferedPart {
+    /// The part's form field name.
+    name: string,
+    /// The uploaded filename, or empty for a non-file part.
+    filename: string,
+    /// The part's whole body.
+    bytes: string,
+}
+
+impl BufferedPart {
+    /// The part's bytes as text. The same value — a moon string is a byte
+    /// string — named for how the caller means to read it.
+    fn text(self: BufferedPart) -> string {
+        self.bytes
+    }
+}
+
+/// Reads one part into memory, refusing anything over the field ceiling.
+///
+/// - `part`: The part currently under the multipart reader.
+/// - `limit`: Byte ceiling; a larger part is refused rather than buffered.
+pub fn read_part(part: MultipartPart, limit: int) -> Result<string, Error> {
+    let mut chunks: [string] = []
+    let mut total = 0
+    while true {
+        let chunk = part.read(CHUNK_BYTES)
+        if chunk.len() == 0 {
+            break
+        }
+        total = total + chunk.len()
+        if total > limit {
+            return err.PAYLOAD_TOO_LARGE(envelope.field_message(
+                "Upload field is too large",
+                part.name,
+            ))
+        }
+        chunks.push(chunk)
+    }
+    ok(chunks.join(""))
+}
+
+/// Drains a part without keeping it. Used for the parts a route does not want:
+/// the body still has to be consumed to reach the next boundary.
+///
+/// - `part`: The part to drain so the reader can reach the next boundary.
+pub fn skip_part(part: MultipartPart) {
+    while true {
+        if part.read(CHUNK_BYTES).len() == 0 {
+            break
+        }
+    }
+}
+
+/// Streams one part through `sink`, returning how many bytes passed through.
+///
+/// The sink is called with each chunk as it arrives, so a video part is written
+/// to storage as it is uploaded rather than assembled in memory first.
+///
+/// - `part`: The part to stream.
+/// - `sink`: Called with each chunk as it arrives; its counts are summed.
+pub fn stream_part(
+    part: MultipartPart,
+    sink: fn(string) -> Result<int, Error>,
+) -> Result<int, Error> {
+    let mut total = 0
+    while true {
+        let chunk = part.read(CHUNK_BYTES)
+        if chunk.len() == 0 {
+            break
+        }
+        let _ = sink(chunk)?
+        total = total + chunk.len()
+    }
+    ok(total)
+}
+
+/// Every part of a request, read into memory under the field ceiling.
+///
+/// For the three upload routes whose parts are all small — a thumbnail, a
+/// sprite sheet, an I-frame manifest and its segment. The video upload does not
+/// use this; it streams.
+///
+/// A repeated name keeps the last part, which is what reading them into a map
+/// does in the original.
+///
+/// - `request`: Streaming request whose body is `multipart/form-data`.
+/// - `limit`: Byte ceiling applied to each part.
+///
+/// ```moon
+/// use moon_router.multipart
+/// use std.http_server.Request
+///
+/// fn fields(request: Request) -> Result<string, Error> {
+///   let parts = multipart.buffered_parts(request, multipart.MAX_FIELD_BYTES)?
+///   let title = if parts.has("title") { parts["title"].text() } else { "" }
+///   ok(title)
+/// }
+///
+/// fn main() {
+///   println(multipart.extension_of("C:\\uploads\\Poster.WEBP"))
+///   println(multipart.CHUNK_BYTES)
+///   println(multipart.MAX_UPLOAD_BYTES)
+/// }
+/// ```
+pub fn buffered_parts(request: Request, limit: int) -> Result<{string: BufferedPart}, Error> {
+    let mut out: {string: BufferedPart} = {:}
+    let reader = http_server.multipart(request)
+    while true {
+        match reader.next() {
+            some(part) => {
+                let bytes = read_part(part, limit)?
+                out.set(
+                    part.name,
+                    BufferedPart {
+                        name: part.name,
+                        filename: part.filename,
+                        bytes: bytes,
+                    },
+                )
+            },
+            none => {
+                break
+            },
+        }
+    }
+    ok(out)
+}
+
+/// The extension of an uploaded filename, lowercased, including the dot.
+///
+/// Read from the last dot in the last path segment: an upload from a Windows
+/// client may carry a whole path, and a directory with a dot in its name must
+/// not be mistaken for a file type.
+///
+/// - `filename`: Uploaded filename, possibly carrying a whole Windows path.
+pub fn extension_of(filename: string) -> string {
+    let mut name = filename
+    for separator in ["/", "\\"] {
+        let mut index = name.len() - 1
+        while index >= 0 {
+            if name.slice(index, index + 1) == separator {
+                name = name.slice(index + 1, name.len())
+                break
+            }
+            index = index - 1
+        }
+    }
+    let mut dot = -1
+    let mut index = 0
+    while index < name.len() {
+        if name.slice(index, index + 1) == "." {
+            dot = index
+        }
+        index = index + 1
+    }
+    if dot < 0 {
+        ""
+    } else {
+        name.slice(dot, name.len()).to_lower()
+    }
+}
+
+/// Checks that an uploaded part is a PNG, JPEG, GIF, BMP or PPM image no
+/// larger than `max_width` x `max_height`, reading only its header, so a
+/// renamed file or a decompression bomb is refused before anything decodes
+/// it. A failure is a `VALIDATION_ERROR` naming the part's field.
+///
+/// - `part`: The buffered upload.
+/// - `max_width`, `max_height`: The largest accepted dimensions.
+///
+/// ```moon
+/// use moon_router.multipart
+/// use moon_router.multipart.BufferedPart
+/// use std.image
+///
+/// fn main() {
+///   let png = image.encode_png(image.filled(4, 3, image.red()))
+///   let part = BufferedPart { name: "poster", filename: "p.png", bytes: png }
+///   let info = multipart.image_info(part, 4096, 4096).unwrap()
+///   println("${info.width}x${info.height}") // 4x3
+///   println(multipart.image_info(BufferedPart { name: "poster", filename: "p.png", bytes: "hello" }, 64, 64).is_err()) // true
+/// }
+/// ```
+pub fn image_info(
+    part: BufferedPart,
+    max_width: int,
+    max_height: int,
+) -> Result<image.Info, Error> {
+    let info = match image.info(part.bytes) {
+        ok(i) => i,
+        err(_) => {
+            return err.VALIDATION_ERROR(envelope.field_message(
+                "Upload is not a supported image",
+                part.name,
+            ))
+        },
+    }
+    if info.width > max_width || info.height > max_height {
+        return err.VALIDATION_ERROR(envelope.field_message(
+            "Image is larger than ${max_width}x${max_height}",
+            part.name,
+        ))
+    }
+    ok(info)
+}

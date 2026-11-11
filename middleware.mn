@@ -1,0 +1,327 @@
+use router
+use router.{Ctx}
+use std.http.Response
+use std.http_server.Request
+
+// moon_router.middleware — stock middleware: request logging and CORS.
+//
+// A middleware is `fn(Ctx, next) -> Response`; these constructors return one.
+// Recovery and timeouts are properties of `router.dispatch_async` (they need
+// the scheduler), not chain middleware — see router.mn.
+//
+// Each stock middleware comes in two: the sync one, and the `_async` twin.
+// The twins are not a convenience — `use_mw_async` feeds a separate chain
+// by design, because a sync onion cannot wrap a leaf that
+// awaits, so a service whose routes are all `*_async` (which is every service
+// that talks to a database) cannot reach `logging()` or `cors()` at all.
+
+/// Structured request logging via `std.log`: one info record per request
+/// with method, path, status, and wall duration.
+pub fn logging() -> fn(Ctx, fn(Ctx) -> Response) -> Response {
+    |ctx, next| {
+        let started = std.time.monotonic_ms()
+        let response = next(ctx)
+        std.log.info_with(
+            "request",
+            {
+                "method": std.json.to_string(std.json.Json.Str(ctx.req.method)),
+                "path": std.json.to_string(std.json.Json.Str(ctx.req.path)),
+                "status": std.json.to_string(std.json.Json.Int(response.status)),
+                "ms": std.json.to_string(std.json.Json.Int(std.time.monotonic_ms() - started)),
+            },
+        )
+        response
+    }
+}
+
+/// CORS configuration; `permissive()` gives the common defaults.
+pub struct CorsOptions {
+    /// Value of `Access-Control-Allow-Origin`; `*` allows any.
+    allow_origin: string,
+    /// Methods a preflight is told are allowed, comma-separated.
+    allow_methods: string,
+    /// Request headers a preflight is told are allowed, comma-separated.
+    allow_headers: string,
+    /// Response headers a browser lets a script read. Empty sends none.
+    ///
+    /// The one nobody remembers until a media player breaks: without
+    /// `Content-Range` here, a cross-origin range request succeeds and the
+    /// script still cannot see where in the file it landed.
+    expose_headers: string,
+    /// Whether the browser may send credentials. A `*` origin and credentials
+    /// are mutually exclusive by spec, so a service that sets this names an
+    /// origin.
+    allow_credentials: bool,
+    /// How long a browser may cache the preflight answer, in seconds.
+    max_age: int,
+    /// Answer OPTIONS from these rules alone, before matching.
+    ///
+    /// A preflight to a path no route claims must not be a 404, or the browser
+    /// refuses the real request that would have followed — and a preflight to
+    /// a path that *is* claimed under another verb must not be a 405 for the
+    /// same reason. Off by default: the package's existing behaviour is chi's,
+    /// where a preflight runs the matched node's chain.
+    ///
+    /// Installed by `cors_async` through `router.use_preflight`.
+    preflight_unmatched: bool,
+}
+
+/// `*` origin, the common verb set, `Content-Type, Authorization` headers.
+///
+/// `expose_headers`, `allow_credentials` and `preflight_unmatched` are all off.
+///
+/// ```moon
+/// use moon_router.envelope
+/// use moon_router.middleware
+/// use moon_router.router
+/// use std.http.Response
+/// use std.http_server.Request
+///
+/// fn main() {
+///   let mut app = router.new()
+///   let policy = middleware.permissive()
+///   app.use_mw(middleware.logging())
+///   app.use_mw(middleware.cors(policy))
+///   app.get("/health", |_ctx| envelope.success("{\"ok\":true}"))
+///   let response = app.dispatch(router.detached_request("GET", "/health", "", ""))
+///   println(middleware.with_cors(response, policy).headers)
+/// }
+/// ```
+pub fn permissive() -> CorsOptions {
+    CorsOptions {
+        allow_origin: "*",
+        allow_methods: "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS",
+        allow_headers: "Content-Type, Authorization",
+        expose_headers: "",
+        allow_credentials: false,
+        max_age: 86400,
+        preflight_unmatched: false,
+    }
+}
+
+fn cors_headers(options: CorsOptions) -> string {
+    "Access-Control-Allow-Origin: " + options.allow_origin + "\nAccess-Control-Allow-Methods: " + options.allow_methods + "\nAccess-Control-Allow-Headers: " + options.allow_headers
+}
+
+/// The headers an *ordinary* response carries: the origin, plus the two that
+/// only mean anything on a real response. Never the verb/header lists, which
+/// answer a preflight's question and nothing else.
+///
+/// - `options`: The policy whose headers are written.
+fn response_headers(options: CorsOptions) -> string {
+    let mut out = "Access-Control-Allow-Origin: " + options.allow_origin
+    if options.expose_headers != "" {
+        out = out + "\nAccess-Control-Expose-Headers: " + options.expose_headers
+    }
+    if options.allow_credentials {
+        out = out + "\nAccess-Control-Allow-Credentials: true"
+    }
+    out
+}
+
+/// `response` with this policy's CORS headers appended.
+///
+/// The middleware does this itself; it is public for the answers that never
+/// reach a middleware — a router's fallbacks run outside the onion by
+/// construction, and those are exactly the four responses (a 404, a wrong
+/// verb, a crash, a timeout) a browser most needs to be allowed to read.
+///
+/// - `response`: The response the headers are appended to.
+/// - `options`: The policy whose headers are written.
+pub fn with_cors(response: Response, options: CorsOptions) -> Response {
+    let headers = if response.headers == "" {
+        response_headers(options)
+    } else {
+        response.headers + "\n" + response_headers(options)
+    }
+    Response {
+        status: response.status,
+        body: response.body,
+        headers: headers,
+        url: "",
+    }
+}
+
+/// The full preflight answer: 204 and every rule a browser asked about.
+///
+/// - `options`: The policy whose headers are written.
+fn preflight_response(options: CorsOptions) -> Response {
+    let mut headers = cors_headers(options)
+    if options.expose_headers != "" {
+        headers = headers + "\nAccess-Control-Expose-Headers: " + options.expose_headers
+    }
+    if options.allow_credentials {
+        headers = headers + "\nAccess-Control-Allow-Credentials: true"
+    }
+    Response {
+        status: 204,
+        body: "",
+        headers: headers + "\nAccess-Control-Max-Age: " + to_string(options.max_age),
+        url: "",
+    }
+}
+
+/// CORS middleware: answers OPTIONS preflights with 204 plus the
+/// Access-Control-* headers (the router routes a method-miss through the
+/// node's middleware chain, which is what makes this fire), and appends
+/// `Access-Control-Allow-Origin` to ordinary responses.
+///
+/// - `options`: The policy the middleware enforces.
+pub fn cors(options: CorsOptions) -> fn(Ctx, fn(Ctx) -> Response) -> Response {
+    |ctx, next| {
+        if ctx.req.method == "OPTIONS" {
+            return Response {
+                status: 204,
+                body: "",
+                headers: cors_headers(options) + "\nAccess-Control-Max-Age: " + to_string(
+                    options.max_age,
+                ),
+                url: "",
+            }
+        }
+        let response = next(ctx)
+        Response {
+            status: response.status,
+            body: response.body,
+            headers: response.headers + "\nAccess-Control-Allow-Origin: " + options.allow_origin,
+            url: "",
+        }
+    }
+}
+
+// ------------------------------------------------------------ the async twins
+
+/// One request, as a logging sink sees it. `path` is `router.path_of` — the
+/// query dropped, and a trailing slash with it — so two spellings of the same
+/// resource are one line in a log and one label in a metric.
+pub struct RequestRecord {
+    /// HTTP method, uppercase.
+    method: string,
+    /// Request path with the query string and any trailing slash dropped.
+    path: string,
+    /// Status the router answered with.
+    status: int,
+    /// Wall-clock duration of the request in milliseconds.
+    ms: long,
+}
+
+/// How `logging_async` decides what to record and where to send it.
+pub struct LoggingOptions {
+    /// Paths logged only when they fail. A UI polling a job list emits
+    /// thousands of lines an hour that bury everything else.
+    quiet: fn(string) -> bool,
+    /// Where a record goes. Zero or one, the package's idiom for an optional
+    /// function (`Route.async_handler`, `Router.fallbacks`): empty is
+    /// `std.log`, which is what a service with no opinion wants. A service
+    /// that renders readable lines for a person passes its own.
+    sink: [fn(RequestRecord) -> void],
+}
+
+/// Log everything, through `std.log`.
+pub fn log_all() -> LoggingOptions {
+    LoggingOptions {
+        quiet: |_path| false,
+        sink: [],
+    }
+}
+
+/// A structured record per request, the level chosen by the status: a 4xx or
+/// 5xx is a warning, everything else is information.
+///
+/// - `record`: The finished request to write.
+pub fn log_record(record: RequestRecord) {
+    let fields = {
+        "method": std.json.to_string(std.json.Json.Str(record.method)),
+        "path": std.json.to_string(std.json.Json.Str(record.path)),
+        "status": std.json.to_string(std.json.Json.Int(record.status)),
+        "ms": std.json.to_string(std.json.Json.Int(record.ms)),
+    }
+    if record.status >= 400 {
+        std.log.warn_with("request", fields)
+    } else {
+        std.log.info_with("request", fields)
+    }
+}
+
+/// The async twin of `logging()`: one record per request, with the quiet-path
+/// rule and the caller's sink.
+///
+/// This is the one an ordinary service actually reaches. Every route that
+/// talks to a database is registered with `*_async`, and `use_mw_async` feeds
+/// a chain of its own, so `logging()` never fires for any of them.
+///
+/// - `options`: Which paths stay quiet, and where records go.
+///
+/// ```moon
+/// use moon_router.middleware
+/// use moon_router.router
+/// use std.http.Response
+///
+/// fn main() {
+///   let mut app = router.new()
+///   let logging = middleware.log_all()
+///   app.use_mw_async(middleware.logging_async(logging))
+///   app.use_mw_async(middleware.cors_async(middleware.permissive()))
+/// }
+/// ```
+pub fn logging_async(
+    options: LoggingOptions,
+) -> fn(Ctx, fn(Ctx) -> Future<Response>) -> Future<Response> {
+    |ctx, next| observe(options, ctx, next)
+}
+
+async fn observe(options: LoggingOptions, ctx: Ctx, next: fn(Ctx) -> Future<Response>) -> Response {
+    let started = std.time.monotonic_ms()
+    let response = await next(ctx)
+    let path = router.path_of(ctx.req.path)
+    // A quiet path still reports a failure: silence is about healthy polls,
+    // not about hiding the moment one stops being healthy.
+    if response.status < 400 && options.quiet(path) {
+        return response
+    }
+    let record = RequestRecord {
+        method: ctx.req.method,
+        path: path,
+        status: response.status,
+        ms: std.time.monotonic_ms() - started,
+    }
+    if options.sink.len() > 0 {
+        let emit = options.sink[0]
+        emit(record)
+    } else {
+        log_record(record)
+    }
+    response
+}
+
+/// The async twin of `cors()`: a preflight answered with 204 and the rules,
+/// and the response headers on everything else.
+///
+/// With `preflight_unmatched` set this also installs a
+/// `router.use_preflight` responder, because a preflight to a path no route
+/// claims never reaches a middleware chain at all — there is no matched node
+/// whose onion could run. That is a side effect on the process rather than on
+/// a value, and it is deliberate: the alternative is every service repeating
+/// the four-line OPTIONS short-circuit ahead of `dispatch_async`, which is
+/// exactly the code this replaces.
+///
+/// - `options`: The policy the middleware enforces.
+pub fn cors_async(
+    options: CorsOptions,
+) -> fn(Ctx, fn(Ctx) -> Future<Response>) -> Future<Response> {
+    if options.preflight_unmatched {
+        router.use_preflight(|_req| preflight_response(options))
+    }
+    |ctx, next| cors_around(options, ctx, next)
+}
+
+async fn cors_around(
+    options: CorsOptions,
+    ctx: Ctx,
+    next: fn(Ctx) -> Future<Response>,
+) -> Response {
+    if ctx.req.method == "OPTIONS" {
+        return preflight_response(options)
+    }
+    with_cors(await next(ctx), options)
+}

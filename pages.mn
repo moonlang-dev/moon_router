@@ -1,0 +1,33 @@
+// HTML pages from `std.template`: an environment over a template directory
+// and a handler helper that renders one page as a response.
+
+use std.http.Response
+use std.template
+use std.template.Environment
+
+/// The templates under `dir`, escaped for HTML by context, strict about
+/// undefined names, and parsed once.
+pub fn templates(dir: string) -> Environment {
+    template.environment(template.env_options(template.dir_loader(dir)))
+}
+
+/// The template `name` from `env` rendered for `value` as a `text/html`
+/// response; a template that fails to load or render is a 500 response
+/// whose body names the error.
+///
+/// - `env`: The environment, usually from `templates`.
+/// - `name`: The template's path under the environment's directory.
+/// - `value`: The value whose fields the template reads.
+/// - `status`: HTTP status code to send on success.
+pub fn page<T>(env: Environment, name: string, value: T, status: int = 200) -> Response {
+    match env.get(name) {
+        ok(t) => match std.http_server.render_html(t, value, status) {
+            ok(response) => response,
+            err(e) => std.http_server.text(
+                500,
+                "template " + name + ": " + e.name + ": " + e.message,
+            ),
+        },
+        err(e) => std.http_server.text(500, "template " + name + ": " + e.name + ": " + e.message),
+    }
+}

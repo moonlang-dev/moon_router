@@ -1,0 +1,383 @@
+// moon_router.envelope — one consistent JSON error/response shape, and the
+// mapping from a moon `Error` to it.
+//
+// Every non-2xx a service returns should look the same on the wire:
+//   {"error":{"message":"...","code":"...","field":"...","status_code":404}}
+// `app_error` never leaks internal error text: pass a generic message and log
+// the detail (the recovery path in `router.dispatch_async` does exactly that).
+//
+// The second half is the part every moon web service ends up writing for
+// itself. A handler fails with `err.NOT_FOUND("no such video")`, and something
+// has to decide that this is a 404 whose wire code is `NOT_FOUND` while
+// `err.SqlError(..)` is a 500 whose wire code says nothing about SQL. That is
+// `status_for`/`code_for`, and `from_error` is the two of them plus the
+// envelope.
+//
+// A validation error usually wants to name the offending *field*, and moon has
+// no user-constructible error payload to put it in — `err.Name("message")`
+// builds the built-in `Error` and that is all. So a field rides in the message
+// behind a U+0001 separator, put there by `field_message` and taken back out by
+// `split_field`. No other producer may emit that byte.
+
+use std.http.Response
+use std.json.Json
+
+/// A 200 response with a JSON body. (`ok` is a moon keyword, hence `success`.)
+///
+/// - `json_body`: Already-serialized JSON text.
+///
+/// ```moon
+/// use moon_router.envelope
+/// use std.http.Response
+/// use std.json.Json
+///
+/// struct Project { name: string, year: int }
+///
+/// fn main() {
+///   println(envelope.success("{\"ok\":true}").status)
+///   println(envelope.ok_status(201, "{\"created\":true}").status)
+///   println(envelope.ok_json(Json.Obj({"name": Json.Str("moon")})).body)
+///   println(envelope.ok_typed(Project { name: "moon", year: 2026 }).body)
+///   println(envelope.no_content().status)
+///   println(envelope.from_result(ok("{}")).status)
+/// }
+/// ```
+pub fn success(json_body: string) -> Response {
+    std.http_server.json(200, json_body)
+}
+
+/// A JSON response with an explicit status.
+///
+/// - `status`: HTTP status for the response.
+/// - `json_body`: Already-serialized JSON text.
+pub fn ok_status(status: int, json_body: string) -> Response {
+    std.http_server.json(status, json_body)
+}
+
+/// How this process renders an error body: `(status, code, message, field)`
+/// to the bytes a client reads. `none` is this package's nested envelope,
+/// which is what every caller gets until one says otherwise.
+///
+/// Deliberately not a `Router` property. A body shape belongs to a service's
+/// wire contract rather than to a route group, and a handler calling
+/// `from_error` has no router in scope to consult — the seam is the one
+/// `std.log.set_handler` already uses for the same reason.
+let mut error_body: Optional<fn(int, string, string, string) -> string> = none
+
+/// Installs the application's error body rendering. Set once, at boot.
+///
+/// A service replacing one written in another language has a shape it must
+/// match byte for byte, and it is usually not this one: Go's `AppError` is
+/// flat, and a Go service encodes it with HTML escaping and a trailing LF. A
+/// closure rather than a fixed set of shapes, because the encoder is the
+/// application's too.
+///
+/// - `render`: Called as `render(status, code, message, field)` to produce the
+///   error body.
+pub fn use_error_body(render: fn(int, string, string, string) -> string) {
+    error_body = some(render)
+}
+
+/// Restores this package's nested envelope.
+pub fn clear_error_body() {
+    error_body = none
+}
+
+/// This package's shape:
+/// `{"error":{"message":…,"code":…,"field":…,"status_code":…}}`.
+///
+/// - `status`: HTTP status for the response.
+/// - `code`: Machine-readable error code.
+/// - `message`: Human-readable message.
+/// - `field`: Field the error is about; omitted when empty.
+pub fn nested_error_body(status: int, code: string, message: string, field: string) -> string {
+    let field_part = if field == "" {
+        ""
+    } else {
+        ",\"field\":" + std.json.to_string(std.json.Json.Str(field))
+    }
+    "{\"error\":{\"message\":" + std.json.to_string(std.json.Json.Str(message)) + ",\"code\":" + std
+        .json
+        .to_string(
+        std.json.Json.Str(code),
+    ) + field_part + ",\"status_code\":" + to_string(status) + "}}"
+}
+
+/// The flat shape a Go `AppError` emits: `{"error":…,"code":…,"field":…}`,
+/// with the status carried by the response line alone.
+///
+/// - `status`: HTTP status for the response.
+/// - `code`: Machine-readable error code.
+/// - `message`: Human-readable message.
+/// - `field`: Field the error is about; omitted when empty.
+pub fn flat_error_body(status: int, code: string, message: string, field: string) -> string {
+    // The status is in the signature because a renderer is chosen once and
+    // has to serve every call; this shape happens not to want it.
+    let _ = status
+    let field_part = if field == "" {
+        ""
+    } else {
+        ",\"field\":" + std.json.to_string(std.json.Json.Str(field))
+    }
+    "{\"error\":" + std.json.to_string(std.json.Json.Str(message)) + ",\"code\":" + std
+        .json
+        .to_string(
+        std.json.Json.Str(code),
+    ) + field_part + "}"
+}
+
+/// The AppError envelope: `field` is omitted when empty.
+///
+/// - `status`: HTTP status for the response.
+/// - `code`: Machine-readable error code.
+/// - `message`: Human-readable message.
+/// - `field`: Field the error is about; omitted when empty.
+///
+/// ```moon
+/// use moon_router.envelope
+/// use std.http.Response
+///
+/// fn main() {
+///   let carried = envelope.field_message("title is required", "title")
+///   let (message, field) = envelope.split_field(carried)
+///   println(message + ":" + field)
+///   println(envelope.status_for("NOT_FOUND"))
+///   println(envelope.code_for("SqlError"))
+///   println(envelope.app_error(400, "VALIDATION_ERROR", message, field).body)
+///   let failed: Result<string, Error> = err.NOT_FOUND("missing")
+///   println(envelope.from_result(failed).status)
+/// }
+/// ```
+pub fn app_error(status: int, code: string, message: string, field: string) -> Response {
+    match error_body {
+        some(render) => std.http_server.json(status, render(status, code, message, field)),
+        none => std.http_server.json(status, nested_error_body(status, code, message, field)),
+    }
+}
+
+/// The separator a carried field name hides behind. U+0001, which no message
+/// a person writes contains.
+pub fn field_separator() -> string {
+    std.strings.from_code(1)
+}
+
+/// A message that carries `field` with it, for `err.VALIDATION_ERROR(..)`.
+///
+/// - `message`: Human-readable message.
+/// - `field`: Field name carried alongside it.
+pub fn field_message(message: string, field: string) -> string {
+    if field == "" {
+        message
+    } else {
+        message + field_separator() + field
+    }
+}
+
+/// Splits a carried message back into `(message, field)`.
+///
+/// - `message`: A message built by `field_message`.
+pub fn split_field(message: string) -> (string, string) {
+    let index = message.find(field_separator()) ?? -1
+    if index < 0 {
+        (message, "")
+    } else {
+        (
+            message.slice(0, index),
+            message.slice(index + 1, message.len()),
+        )
+    }
+}
+
+/// The HTTP status for an error name.
+///
+/// The names are the conventional ones a service raises, and everything
+/// unrecognised is 500 — a failure nobody classified is an internal one, which
+/// is the safe direction: it is better to under-report a client error than to
+/// tell a client its request was at fault when the server was.
+///
+/// - `name`: The failure's error name.
+pub fn status_for(name: string) -> int {
+    match name {
+        "VALIDATION_ERROR" => 400,
+        "UNAUTHORIZED" => 401,
+        "FORBIDDEN" => 403,
+        "NOT_FOUND" => 404,
+        "CONFLICT" => 409,
+        "PAYLOAD_TOO_LARGE" => 413,
+        "RANGE_NOT_SATISFIABLE" => 416,
+        "TOO_MANY_REQUESTS" => 429,
+        "OPERATION_FAILED" => 500,
+        "SERVICE_UNAVAILABLE" => 503,
+        _ => 500,
+    }
+}
+
+/// The wire `code` for an error name: a classified name passes through,
+/// anything else reports as `INTERNAL_ERROR`.
+///
+/// This is the leak guard. An unclassified failure's name is an internal
+/// detail — `SqlError`, `WriteFailed`, whatever the module happened to call it
+/// — and a client that could read it would be reading the server's internals.
+/// `OPERATION_FAILED` is the exception because it is deliberately raised as a
+/// 500 a client is meant to see named.
+///
+/// - `name`: The failure's error name.
+pub fn code_for(name: string) -> string {
+    if status_for(name) == 500 && name != "OPERATION_FAILED" {
+        "INTERNAL_ERROR"
+    } else {
+        name
+    }
+}
+
+/// A failure as an envelope response: status and code derived from its name,
+/// and a carried field name taken back out of its message.
+///
+/// - `failure`: The failure to render.
+pub fn from_error(failure: Error) -> Response {
+    let (message, field) = split_field(failure.message)
+    app_error(
+        status_for(failure.name),
+        code_for(failure.name),
+        message,
+        field,
+    )
+}
+
+/// Either half of a handler's `Result`, rendered.
+///
+/// The shape almost every handler ends in, and the reason `from_error` exists:
+/// a handler computes a `Result<string, Error>` and this decides whether that
+/// is a 200 with a body or a status derived from the failure's name.
+///
+/// - `outcome`: A handler result whose success half is already-serialized JSON
+///   text.
+pub fn from_result(outcome: Result<string, Error>) -> Response {
+    match outcome {
+        ok(json_body) => success(json_body),
+        err(failure) => from_error(failure),
+    }
+}
+
+// ------------------------------------------------- responses over `Json`
+//
+// The four above take JSON *text*, which is what a handler has once it has
+// encoded something. A handler that has not yet has a `Json`, and encoding it
+// at every call site is both noise and a place to forget the content type.
+
+/// How this process turns a `Json` into response bytes. `none` is
+/// `std.json.to_string`, which is what every caller gets until one says
+/// otherwise.
+///
+/// The same seam as `error_body`, for the same reason: a service replacing one
+/// written in another language has a byte shape it must match, and the encoder
+/// is the application's. Go's `encoding/json` escapes `&`, `<`, `>` and the
+/// line separators even inside plain strings, appends one LF per document, and
+/// prints a whole float bare — none of which `to_string` does. Without this
+/// hook, `ok_typed` below would be unusable by exactly the services that most
+/// need it, because it would silently emit the wrong bytes.
+let mut json_body: Optional<fn(Json) -> string> = none
+
+/// Installs the application's success-body encoding. Set once, at boot.
+///
+/// - `render`: Called with the response tree to produce the body bytes.
+pub fn use_json_body(render: fn(Json) -> string) {
+    json_body = some(render)
+}
+
+/// Restores `std.json.to_string`.
+pub fn clear_json_body() {
+    json_body = none
+}
+
+/// `value` as response bytes, through the installed encoder.
+///
+/// - `value`: The tree to render.
+pub fn encode_body(value: Json) -> string {
+    match json_body {
+        some(render) => render(value),
+        none => std.json.to_string(value),
+    }
+}
+
+/// A JSON response carrying an encoded `Json` value.
+///
+/// - `status`: HTTP status for the response.
+/// - `value`: The tree to render into the body.
+pub fn json(status: int, value: Json) -> Response {
+    std.http_server.json(status, encode_body(value))
+}
+
+/// `json` at 200. (`ok` is a moon keyword, hence the longer name.)
+///
+/// - `value`: The tree to render into the body.
+pub fn ok_json(value: Json) -> Response {
+    json(200, value)
+}
+
+/// 204 with no body: an action that succeeded and has nothing to report.
+pub fn no_content() -> Response {
+    Response {
+        status: 204,
+        body: "",
+        headers: "",
+        url: "",
+    }
+}
+
+/// Either half of a handler's `Result<Json, Error>`, rendered.
+///
+/// - `outcome`: A handler result whose success half is a `Json` tree.
+pub fn from_json_result(outcome: Result<Json, Error>) -> Response {
+    match outcome {
+        ok(value) => ok_json(value),
+        err(failure) => from_error(failure),
+    }
+}
+
+// ------------------------------------------------- responses over a typed `T`
+//
+// The boundary that used to force a hand-built `Json` even for a type the
+// reflective codec already knows how to encode. A handler with a `Profile` had
+// to turn it into a `Json` itself before anything here would take it, which is
+// the hand-assembly a codec exists to remove, relocated to the edge.
+
+/// A typed JSON response with an explicit status: `T` encoded by its codec.
+///
+/// Total, because `to_value<T>` is — a `T` this cannot encode
+/// is a compile error at the call site naming the part of the type that is the
+/// problem, not a `Result` every handler has to thread.
+///
+/// The bytes are written straight out of the value when nothing has installed a
+/// body renderer, which is the ordinary case. Going through `to_value<T>` would
+/// materialize the whole document as a `Json` tree so that `to_string` could
+/// read it once and throw it away — measured at 50 ms of tree against 14 ms of
+/// direct encode for a 1.5 MB listing (overhaul plan E2). A service that *has*
+/// installed a renderer still gets the tree, because a renderer's argument is a
+/// `Json` by signature.
+///
+/// - `status`: HTTP status for the response.
+/// - `value`: The value to encode by `T`'s codec.
+pub fn typed<T>(status: int, value: T) -> Response {
+    match json_body {
+        some(render) => std.http_server.json(status, render(std.json.to_value(value))),
+        none => std.http_server.json(status, std.json.encode(value)),
+    }
+}
+
+/// `typed` at 200.
+///
+/// - `value`: The value to encode by `T`'s codec.
+pub fn ok_typed<T>(value: T) -> Response {
+    typed(200, value)
+}
+
+/// Either half of a handler's `Result<T, Error>`, rendered.
+///
+/// - `outcome`: A handler result whose success half is a `T`.
+pub fn from_typed_result<T>(outcome: Result<T, Error>) -> Response {
+    match outcome {
+        ok(value) => ok_typed(value),
+        err(failure) => from_error(failure),
+    }
+}

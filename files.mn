@@ -1,0 +1,135 @@
+// moon_router.files — routes that answer with bytes rather than a value.
+//
+// A `Response` carries its whole body, and a multi-gigabyte video cannot be
+// one. `std.http_server.serve_file` already does the HTTP work — `HEAD`,
+// `Accept-Ranges`, one `Range`, `If-Range`, 206 slices and 416, reading the
+// file in windows rather than materialising it — and `router.responded()` is
+// already the sentinel for a handler that wrote to the socket itself. What was
+// missing was the join between them, so every service that streams a file kept
+// a second dispatcher *outside* the router, with its own extension table, its
+// own GET/HEAD guard and its own header lookup. The cost was never the
+// duplication: it was that those routes were invisible to `Router.surface`,
+// so nothing could enumerate what the service actually answers.
+//
+// `Router.get_stream` closes that, and this module is what a streaming
+// handler needs on the way.
+
+use router
+use router.{Ctx}
+use std.embed.Embedded
+use std.http.Response
+use std.http_server.Request
+
+/// The media type an extension names (`std.mime.type_for_path`),
+/// `application/octet-stream` when it names nothing the table knows. A service
+/// with a format of its own registers it with `std.mime.add` or passes the
+/// content type to `serve` directly.
+///
+/// - `path`: Path whose extension names the media type.
+///
+/// ```moon
+/// use moon_router.files
+/// use moon_router.router
+/// use std.http_server.Request
+///
+/// fn main() {
+///   println(files.content_type_for("poster.webp"))
+///   println(files.content_type_for("video.mp4"))
+///   println(files.is_read_method("HEAD"))
+///   let request = router.detached_request(
+///     "GET",
+///     "/video",
+///     "Range: bytes=100-199",
+///     "",
+///   )
+///   println(files.header(request, "range"))
+///   println(files.range_start(request, 1000))
+/// }
+/// ```
+pub fn content_type_for(path: string) -> string {
+    std.mime.type_for_path(path)
+}
+
+/// Whether `method` asks to read: GET or HEAD.
+///
+/// A file route answers both, and only both — a HEAD is a GET whose body the
+/// client does not want, which is why `serve_file` handles it rather than the
+/// route.
+///
+/// - `method`: HTTP method, uppercase.
+pub fn is_read_method(method: string) -> bool {
+    method == "GET" || method == "HEAD"
+}
+
+/// Request header `name`, or `none` when it was not sent.
+///
+/// `std.http_server.get_header` answers "" for both absent and empty, and a
+/// range parser has to tell those apart: an empty `Range` is a malformed
+/// request, an absent one is an ordinary read.
+///
+/// - `req`: Request to read from.
+/// - `name`: Header name, matched case-insensitively.
+pub fn header(req: Request, name: string) -> Optional<string> {
+    let value = std.http_server.get_header(req, name)
+    if value == "" {
+        let absent: Optional<string> = none
+        absent
+    } else {
+        some(value)
+    }
+}
+
+/// The first byte a `Range` header asks for, or 0 when there is no usable one.
+///
+/// For a log line or a metric — what part of the file a client jumped to.
+/// `serve_file` does the real range handling, including the 416 this cannot
+/// express.
+///
+/// - `req`: Request that may carry a `Range` header.
+/// - `size`: Size of the resource in bytes.
+pub fn range_start(req: Request, size: long) -> long {
+    match std.http.parse_byte_range(header(req, "range"), size) {
+        some(parsed) => parsed.start,
+        none => 0,
+    }
+}
+
+/// Serves `path` on the socket and answers `router.responded()`.
+///
+/// A missing file goes through the application's own not-found rendering
+/// rather than the plain-text 404 `serve_file` writes for an unopenable path:
+/// a service whose 404 is an envelope should answer file routes the same way,
+/// and a client cannot tell which route it asked for from the shape of the
+/// answer it gets.
+///
+/// - `ctx`: Request context, used for the connection and the not-found
+///   rendering.
+/// - `path`: File to serve from disk.
+/// - `content_type`: Value of the `Content-Type` header.
+pub fn serve(ctx: Ctx, path: string, content_type: string) -> Response {
+    if !std.fs.is_file(path) {
+        return router.not_found_for(ctx)
+    }
+    let _served = std.http_server.serve_file(ctx.req, path, content_type)
+    router.responded()
+}
+
+/// `serve` with the content type read off the extension.
+///
+/// - `ctx`: Request context, used for the connection and the not-found
+///   rendering.
+/// - `path`: File to serve from disk; its extension picks the content type.
+pub fn serve_path(ctx: Ctx, path: string) -> Response {
+    serve(ctx, path, content_type_for(path))
+}
+
+/// The file of `files` (compiled in with `std.embed`) that the request's path
+/// names below `prefix`, through `std.http_server.serve_embedded`: its media
+/// type, an `ETag`, `304` on `If-None-Match`, index files and gzip.
+///
+/// - `ctx`: Request context.
+/// - `files`: The embedded tree, such as `embed.dir("public")`.
+/// - `prefix`: The URL path the tree is mounted at.
+pub fn serve_embedded(ctx: Ctx, files: Embedded, prefix: string = "/") -> Response {
+    std.http_server.serve_embedded(ctx.req, files, prefix)
+}

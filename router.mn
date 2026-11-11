@@ -1,0 +1,1299 @@
+// moon_router.router — chi-style HTTP routing for std.http_server.
+//
+// A `Router` is a value handle over a shared `RouteTable` object, so `group`
+// returns a cheap prefixed view and every view registers into one tree.
+// Arrays are values in Moon, which is why the table is a class: a route pushed
+// through one handle has to be visible through every other. Matching
+// semantics follow go-chi where services
+// depend on them: literal segments beat `{param}` segments at the same depth
+// (with backtracking), a trailing `{rest...}` wildcard captures the remaining
+// path, a matched path with the wrong method is 405 with an `Allow` header,
+// and anything else is 404. Params are percent-decoded. The one place this
+// departs from chi is the near-universal rule everywhere else: a HEAD with no
+// HEAD route of its own runs the GET one (see `method_index`).
+//
+// Middleware is an onion of `fn(Ctx, next) -> Response` closures: the chain
+// active on a group at registration time is captured per route, first `use`d
+// runs outermost. A method-miss (405/preflight) still runs the node's
+// middleware chain, which is what lets `middleware.cors` answer OPTIONS
+// preflights exactly like chi's cors middleware does.
+//
+// Timeouts and error recovery need the scheduler, so they live on the async
+// entry point `dispatch_async` (used by accept-loop servers); the synchronous
+// `dispatch`/`handler()` path runs the same routes without them.
+
+use std.futures
+use std.http.Response
+use std.http_server.Request
+
+/// Per-request context handed to handlers: the raw request plus decoded
+/// route params. The raw `req` passes through untouched so plan-55 streaming
+/// handlers (`respond_stream`, `serve_file`) keep working.
+pub struct Ctx {
+    /// The request exactly as it arrived, so streaming handlers can still
+    /// answer on the socket.
+    req: Request,
+    /// Route parameters decoded from the path, by their pattern names.
+    params: {string: string},
+}
+
+impl Ctx {
+    /// The decoded value of route param `name`, or "".
+    ///
+    /// - `name`: Route parameter name, as the pattern spells it.
+    fn param(self: Ctx, name: string) -> string {
+        if self.params.has(name) {
+            self.params[name]
+        } else {
+            ""
+        }
+    }
+
+    /// The request's cookies by name (`std.http_server.Request.cookies`).
+    fn cookies(self: Ctx) -> {string: string} {
+        self.req.cookies()
+    }
+
+    /// The cookie `name`, or "".
+    ///
+    /// - `name`: Cookie name.
+    fn cookie(self: Ctx, name: string) -> string {
+        self.req.cookie(name).unwrap_or("")
+    }
+
+    /// The last value given for query key `name`, or "".
+    ///
+    /// Last rather than first, which is what `URLSearchParams.get` answers and
+    /// what a client repeating a key expects to override with.
+    ///
+    /// - `name`: Query key to read.
+    fn query(self: Ctx, name: string) -> string {
+        let values = self.query_all(name)
+        if values.len() == 0 {
+            ""
+        } else {
+            values[values.len() - 1]
+        }
+    }
+
+    /// Every value given for query key `name`, in order — `getAll`. A key
+    /// appearing with no `=` counts, with an empty value.
+    ///
+    /// - `name`: Query key to read.
+    fn query_all(self: Ctx, name: string) -> [string] {
+        let mut out: [string] = []
+        for (key, value) in query_pairs(self.req.path) {
+            if key == name {
+                out.push(value)
+            }
+        }
+        out
+    }
+
+    /// `query`, but falling back when the key is missing *or* empty.
+    ///
+    /// The distinction matters for a query string a browser built: a form
+    /// field left blank arrives as `?limit=`, and a caller that wanted a
+    /// default wants it there too.
+    ///
+    /// - `name`: Query key to read.
+    /// - `fallback`: Value used when the key is missing or empty.
+    fn query_or(self: Ctx, name: string, fallback: string) -> string {
+        let value = self.query(name)
+        if value == "" {
+            fallback
+        } else {
+            value
+        }
+    }
+
+    /// Whether query key `name` was given at all, however empty its value.
+    /// `?force` and `?force=` are both present; a missing key is not.
+    ///
+    /// - `name`: Query key to read.
+    fn has_query(self: Ctx, name: string) -> bool {
+        self.query_all(name).len() > 0
+    }
+
+    /// Query key `name` as an integer, falling back when it is missing, empty
+    /// or not a number.
+    ///
+    /// Falling back rather than failing is the decision every hand-rolled
+    /// version of this makes: a bad `?limit=` should still render the page.
+    /// A route that wants a malformed value *refused* is asking a different
+    /// question — `binding.require_strict_int` is that one.
+    ///
+    /// - `name`: Query key to read.
+    /// - `fallback`: Value used when the key is missing, empty, or not a
+    ///   number.
+    fn query_int(self: Ctx, name: string, fallback: int) -> int {
+        match std.strings.parse_int(self.query(name)) {
+            ok(value) => value,
+            err(_) => fallback,
+        }
+    }
+
+    /// `query_int`, held inside `[low, high]`.
+    ///
+    /// The pagination primitive: a limit a client may raise but not past what
+    /// the server will do, and not below one row. `fallback` is clamped too, so
+    /// a default outside the range cannot escape through the missing-key path.
+    ///
+    /// - `name`: Query key to read.
+    /// - `fallback`: Value used when the key does not parse; it is clamped too.
+    /// - `low`: Lowest value the result may take.
+    /// - `high`: Highest value the result may take.
+    fn query_int_clamped(self: Ctx, name: string, fallback: int, low: int, high: int) -> int {
+        let value = self.query_int(name, fallback)
+        if value < low {
+            low
+        } else if value > high {
+            high
+        } else {
+            value
+        }
+    }
+
+    /// Query key `name` as a boolean.
+    ///
+    /// `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` in any case; anything
+    /// else is `fallback`. A bare `?force` with no value is *true*, because a
+    /// flag a client spelled at all is one it meant to set — which is also
+    /// what `has_query` already reports about it.
+    ///
+    /// - `name`: Query key to read.
+    /// - `fallback`: Value used when the key is missing or unreadable.
+    fn query_bool(self: Ctx, name: string, fallback: bool) -> bool {
+        if !self.has_query(name) {
+            return fallback
+        }
+        let raw = self.query(name).to_lower()
+        if raw == "" || raw == "1" || raw == "true" || raw == "yes" || raw == "on" {
+            return true
+        }
+        if raw == "0" || raw == "false" || raw == "no" || raw == "off" {
+            return false
+        }
+        fallback
+    }
+}
+
+/// The path a request target names: the query string dropped, and a trailing
+/// slash with it, because `/api/videos/` names the resource `/api/videos`
+/// does.
+///
+/// Matching does not need it — the trie splits on segments, so both spellings
+/// already reach the same route — but everything that reads a target *back*
+/// does: a log line, a metric label, a dispatcher looking at the raw target
+/// off the socket. Exported because those readers are otherwise each one
+/// `find("?")` away from getting it subtly wrong.
+///
+/// - `target`: Raw request target, query string and all.
+pub fn path_of(target: string) -> string {
+    let mark = target.find("?") ?? -1
+    let path = if mark < 0 {
+        target
+    } else {
+        target.slice(0, mark)
+    }
+    if path.len() > 1 && path.ends_with("/") {
+        path.slice(0, path.len() - 1)
+    } else {
+        path
+    }
+}
+
+/// `key=value` pairs from a request target's query string, percent-decoded
+/// with `+` read as a space — which is what a query string spells it as and
+/// what `url_decode` deliberately does *not* do, since a `+` in a path segment
+/// is a plus.
+///
+/// - `target`: Raw request target, query string and all.
+pub fn query_pairs(target: string) -> [(string, string)] {
+    let mut out: [(string, string)] = []
+    let some(mark) = target.find("?") else {
+        return out
+    }
+    let query = target.slice(mark + 1, target.len())
+    for pair in query.split("&") {
+        if pair == "" {
+            continue
+        }
+        let equals = pair.find("=") ?? -1
+        if equals < 0 {
+            out.push((query_decode(pair), ""))
+        } else {
+            out.push(
+                (
+                    query_decode(pair.slice(0, equals)),
+                    query_decode(pair.slice(equals + 1, pair.len())),
+                ),
+            )
+        }
+    }
+    out
+}
+
+/// `url_decode` with `+` read as a space.
+///
+/// - `text`: Query-string text to percent-decode, reading `+` as a space.
+pub fn query_decode(text: string) -> string {
+    url_decode(text.replace_all("+", " "))
+}
+
+/// Internal: one registered route (public only so `Router` is spellable
+/// across modules).
+pub struct Route {
+    /// HTTP method this route answers, uppercase.
+    method: string,
+    /// Normalized full path pattern, group prefix included.
+    pattern: string,
+    /// The synchronous handler, or a placeholder for an async route.
+    handler: fn(Ctx) -> Response,
+    /// The async handler, when the route was registered with one. Zero or one
+    /// element, because moon has no `Optional<fn>` worth spelling: a route has
+    /// exactly one handler and this array says which kind it is.
+    ///
+    /// A route registered this way can only be dispatched by `dispatch_async`
+    /// — a synchronous `dispatch` has nothing to await with. It answers 500
+    /// rather than silently running the placeholder.
+    async_handler: [fn(Ctx) -> Future<Response>],
+    /// The synchronous onion captured at registration, outermost first.
+    middleware: [fn(Ctx, fn(Ctx) -> Response) -> Response],
+    /// The async middleware chain, captured the same way `middleware` is. Only
+    /// meaningful on an async route: a sync onion cannot wrap an awaiting leaf.
+    async_middleware: [fn(Ctx, fn(Ctx) -> Future<Response>) -> Future<Response>],
+    /// The group's timeout class in milliseconds; 0 means none.
+    timeout_ms: int,
+}
+
+/// How a router answers a request no handler produced a response for.
+///
+/// Supplied by an application whose wire shape is not this package's — a port
+/// whose 404 is Go's `text/plain` body, say, or one that deliberately answers
+/// 404 for a wrong verb because the router it replaced did not distinguish.
+/// Absent means the envelope, which is what every existing caller gets.
+///
+/// The `Ctx` handed to each is the request as it arrived, with whatever params
+/// were bound before the answer was decided (none, for a 404).
+pub struct Fallbacks {
+    /// No route matched the path at all.
+    not_found: fn(Ctx) -> Response,
+    /// The path matched but the method did not; `allow` is the header value
+    /// this package would have sent. An application that answers 404 for a
+    /// wrong verb returns its own not-found here.
+    method_not_allowed: fn(Ctx, string) -> Response,
+    /// A handler outlived its timeout class, in milliseconds.
+    timed_out: fn(Ctx, int) -> Response,
+}
+
+/// Internal: one trie arena node (public only so `Router` is spellable
+/// across modules).
+pub struct TrieNode {
+    /// Literal segments to their child node index.
+    children: {string: int},
+    /// Node index reached by a `{name}` segment, or -1.
+    param_child: int,
+    /// Name a `{name}` segment binds to.
+    param_name: string,
+    /// Node index reached by a `{rest...}` segment, or -1.
+    wild_child: int,
+    /// Name a `{rest...}` segment binds to.
+    wild_name: string,
+    /// Methods registered at this node, each to its route index.
+    methods: {string: int},
+}
+
+/// The storage every group handle over one router shares: the routes, the
+/// matching trie and the application's fallback rendering. An object rather
+/// than fields of `Router`, because a `Router` is copied freely (`group`,
+/// `with_timeout`, a handle passed to a `register` function) and every copy
+/// must register into the one tree.
+pub class RouteTable {
+    /// Every registered route, in registration order.
+    routes: [Route],
+    /// The matching trie arena; node 0 is the root.
+    nodes: [TrieNode],
+    /// Zero or one, like a route's async handler: the application's own
+    /// fallback rendering, or this package's envelope.
+    fallbacks: [Fallbacks],
+}
+
+/// A routing group: value handle over shared storage plus this group's
+/// prefix, middleware chain, and timeout class.
+pub struct Router {
+    /// The routes, trie and fallbacks, shared by every group handle over it.
+    table: RouteTable,
+    /// This group's normalized path prefix.
+    prefix: string,
+    /// This group's synchronous onion, outermost first.
+    middleware: [fn(Ctx, fn(Ctx) -> Response) -> Response],
+    /// This group's async onion; only async routes see it.
+    async_middleware: [fn(Ctx, fn(Ctx) -> Future<Response>) -> Future<Response>],
+    /// This group's timeout class in milliseconds; 0 means none.
+    timeout_ms: int,
+}
+
+fn empty_node() -> TrieNode {
+    TrieNode {
+        children: {:},
+        param_child: -1,
+        param_name: "",
+        wild_child: -1,
+        wild_name: "",
+        methods: {:},
+    }
+}
+
+/// Creates an empty router.
+///
+/// ```moon
+/// use moon_router.envelope
+/// use moon_router.router
+/// use std.http.Response
+/// use std.http_server.Request
+///
+/// fn main() {
+///   let app = router.new()
+///   let api = app.group("/api")
+///   api.get("/projects/{id}", |ctx| {
+///     envelope.success("{\"id\":\"" + ctx.param("id") + "\"}")
+///   })
+///   api.post("/projects", |_ctx| envelope.ok_status(201, "{}"))
+///
+///   let request = router.detached_request(
+///     "GET",
+///     "/api/projects/moon?limit=20&draft=true",
+///     "",
+///     "",
+///   )
+///   let response = app.dispatch(request)
+///   println(response.status)
+///   println(app.find("GET", "/api/projects/moon").params)
+///   println(app.surface())
+///   println(router.path_of(request.path))
+///   println(router.query_pairs(request.path))
+/// }
+/// ```
+pub fn new() -> Router {
+    Router {
+        table: RouteTable {
+            routes: [],
+            nodes: [empty_node()],
+            fallbacks: [],
+        },
+        prefix: "",
+        middleware: [],
+        async_middleware: [],
+        timeout_ms: 0,
+    }
+}
+
+/// Splits a path or pattern into segments, ignoring empty segments (leading,
+/// trailing, and doubled slashes).
+/// `/` + the non-empty segments, so a leading, trailing or doubled slash on
+/// either a group prefix or a pattern collapses to one form.
+///
+/// - `pattern`: Path or pattern whose empty segments are collapsed.
+fn normalize_pattern(pattern: string) -> string {
+    let segments = split_segments(pattern)
+    if segments.len() == 0 {
+        return "/"
+    }
+    "/" + segments.join("/")
+}
+
+fn split_segments(path: string) -> [string] {
+    let mut out: [string] = []
+    for seg in path.split("/") {
+        if seg != "" {
+            out.push(seg)
+        }
+    }
+    out
+}
+
+/// Percent-decodes a path segment; `+` is left alone (path, not query,
+/// semantics). Invalid escapes pass through literally.
+///
+/// - `text`: Path segment to percent-decode; `+` is left as a plus.
+pub fn url_decode(text: string) -> string {
+    let hex = "0123456789abcdef"
+    let mut out = ""
+    let mut i = 0
+    let n = text.len()
+    while i < n {
+        let c = text.slice(i, i + 1)
+        if c == "%" && i + 2 < n {
+            let hi = hex.find(text.slice(i + 1, i + 2).to_lower()) ?? -1
+            let lo = hex.find(text.slice(i + 2, i + 3).to_lower()) ?? -1
+            if hi >= 0 && lo >= 0 {
+                out = out + std.strings.from_code(hi * 16 + lo)
+                i = i + 3
+                continue
+            }
+        }
+        out = out + c
+        i = i + 1
+    }
+    out
+}
+
+impl Router {
+    /// Registers `handler` for `method` at `pattern` (joined onto the group
+    /// prefix). Pattern segments: literals, `{name}` params, and a trailing
+    /// `{rest...}` wildcard capturing the remaining path.
+    ///
+    /// - `method`: HTTP method to answer, uppercase.
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; its response is sent back.
+    fn route(self: Router, method: string, pattern: string, handler: fn(Ctx) -> Response) {
+        self.register(method, pattern, handler, [])
+    }
+
+    /// The async twin of `route`. The handler may `await`, so a route
+    /// registered this way can only be dispatched by `dispatch_async` — a
+    /// synchronous `dispatch` has nothing to await with, and answers 500
+    /// naming the mistake rather than a 404 the caller would chase in the
+    /// route table.
+    ///
+    /// - `method`: HTTP method to answer, uppercase.
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; the future it returns is
+    ///   awaited for the response.
+    fn route_async(
+        self: Router,
+        method: string,
+        pattern: string,
+        handler: fn(Ctx) -> Future<Response>,
+    ) {
+        self.register(method, pattern, |_c| unreachable_sync(), [handler])
+    }
+
+    fn register(
+        self: Router,
+        method: string,
+        pattern: string,
+        handler: fn(Ctx) -> Response,
+        async_handler: [fn(Ctx) -> Future<Response>],
+    ) {
+        let table = self.table
+        // Normalized, so the recorded pattern is what `surface` and
+        // `find().pattern` report. Matching already ignored empty segments, so
+        // a leading slash on either half was invisible until something read
+        // the pattern back and saw `//api/videos`.
+        let full = normalize_pattern(self.prefix + "/" + pattern)
+        let segments = split_segments(full)
+        let mut node = 0
+        let mut i = 0
+        while i < segments.len() {
+            let seg = segments[i]
+            if seg.starts_with("{") && seg.ends_with("...}") {
+                if i != segments.len() - 1 {
+                    let bad: Result<int, Error> = err.Router("wildcard segment must be last in pattern: " + full)
+                    let _dead = bad.unwrap()
+                }
+                if table.nodes[node].wild_child < 0 {
+                    table.nodes.push(empty_node())
+                    table.nodes[node].wild_child = table.nodes.len() - 1
+                    table.nodes[node].wild_name = seg.slice(1, seg.len() - 4)
+                }
+                node = table.nodes[node].wild_child
+            } else if seg.starts_with("{") && seg.ends_with("}") {
+                if table.nodes[node].param_child < 0 {
+                    table.nodes.push(empty_node())
+                    table.nodes[node].param_child = table.nodes.len() - 1
+                    table.nodes[node].param_name = seg.slice(1, seg.len() - 1)
+                }
+                node = table.nodes[node].param_child
+            } else {
+                if !table.nodes[node].children.has(seg) {
+                    table.nodes.push(empty_node())
+                    table.nodes[node].children[seg] = table.nodes.len() - 1
+                }
+                node = table.nodes[node].children[seg]
+            }
+            i = i + 1
+        }
+        let mut chain: [fn(Ctx, fn(Ctx) -> Response) -> Response] = []
+        for mw in self.middleware {
+            chain.push(mw)
+        }
+        let mut async_chain: [fn(Ctx, fn(Ctx) -> Future<Response>) -> Future<Response>] = []
+        for mw in self.async_middleware {
+            async_chain.push(mw)
+        }
+        table.routes.push(
+            Route {
+                method: method,
+                pattern: full,
+                handler: handler,
+                async_handler: async_handler,
+                middleware: chain,
+                async_middleware: async_chain,
+                timeout_ms: self.timeout_ms,
+            },
+        )
+        table.nodes[node].methods[method] = table.routes.len() - 1
+    }
+
+    /// Registers a synchronous GET route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; its response is sent back.
+    fn get(self: Router, pattern: string, handler: fn(Ctx) -> Response) {
+        self.route("GET", pattern, handler)
+    }
+
+    /// Registers an asynchronous GET route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; the future it returns is
+    ///   awaited for the response.
+    fn get_async(self: Router, pattern: string, handler: fn(Ctx) -> Future<Response>) {
+        self.route_async("GET", pattern, handler)
+    }
+
+    /// Registers a GET route whose handler answers on the socket itself and
+    /// returns `responded()` — a file served through `files.serve`, or a
+    /// hand-built `respond_stream`.
+    ///
+    /// It registers exactly like `get` and dispatches exactly like `get` —
+    /// including the HEAD that comes with every GET, which is what lets
+    /// `serve_file` answer a player asking how big a video is. The name exists
+    /// for the two readers who cannot see the handler: a person, who learns
+    /// that this route's bytes never pass through a `Response`, and
+    /// `Router.surface`, which now reports a pattern that used to live in a
+    /// dispatcher outside the router and in a hand-kept list beside it.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Answers on the socket itself and returns `responded()`.
+    fn get_stream(self: Router, pattern: string, handler: fn(Ctx) -> Response) {
+        self.route("GET", pattern, handler)
+    }
+
+    /// Registers an asynchronous POST route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; the future it returns is
+    ///   awaited for the response.
+    fn post_async(self: Router, pattern: string, handler: fn(Ctx) -> Future<Response>) {
+        self.route_async("POST", pattern, handler)
+    }
+
+    /// Registers an asynchronous PUT route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; the future it returns is
+    ///   awaited for the response.
+    fn put_async(self: Router, pattern: string, handler: fn(Ctx) -> Future<Response>) {
+        self.route_async("PUT", pattern, handler)
+    }
+
+    /// Registers an asynchronous DELETE route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; the future it returns is
+    ///   awaited for the response.
+    fn delete_async(self: Router, pattern: string, handler: fn(Ctx) -> Future<Response>) {
+        self.route_async("DELETE", pattern, handler)
+    }
+
+    /// Registers an asynchronous PATCH route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; the future it returns is
+    ///   awaited for the response.
+    fn patch_async(self: Router, pattern: string, handler: fn(Ctx) -> Future<Response>) {
+        self.route_async("PATCH", pattern, handler)
+    }
+
+    /// Registers an asynchronous HEAD route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; the future it returns is
+    ///   awaited for the response.
+    fn head_async(self: Router, pattern: string, handler: fn(Ctx) -> Future<Response>) {
+        self.route_async("HEAD", pattern, handler)
+    }
+    /// Registers a synchronous POST route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; its response is sent back.
+    fn post(self: Router, pattern: string, handler: fn(Ctx) -> Response) {
+        self.route("POST", pattern, handler)
+    }
+    /// Registers a synchronous PUT route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; its response is sent back.
+    fn put(self: Router, pattern: string, handler: fn(Ctx) -> Response) {
+        self.route("PUT", pattern, handler)
+    }
+    /// Registers a synchronous DELETE route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; its response is sent back.
+    fn delete(self: Router, pattern: string, handler: fn(Ctx) -> Response) {
+        self.route("DELETE", pattern, handler)
+    }
+    /// Registers a synchronous PATCH route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; its response is sent back.
+    fn patch(self: Router, pattern: string, handler: fn(Ctx) -> Response) {
+        self.route("PATCH", pattern, handler)
+    }
+    /// Registers a synchronous HEAD route.
+    ///
+    /// - `pattern`: Path pattern, joined onto the group prefix; `{name}`
+    ///   captures a segment and a trailing `{rest...}` captures what is left.
+    /// - `handler`: Called with the request context; its response is sent back.
+    fn head(self: Router, pattern: string, handler: fn(Ctx) -> Response) {
+        self.route("HEAD", pattern, handler)
+    }
+
+    /// Returns a nested group at `prefix`. The group shares this router's
+    /// routes and inherits a copy of its middleware chain and timeout class,
+    /// so later `use` calls on either side do not leak across.
+    ///
+    /// - `prefix`: Path prefix every route of the group hangs under, joined
+    ///   onto this router's own.
+    fn group(self: Router, prefix: string) -> Router {
+        let mut chain: [fn(Ctx, fn(Ctx) -> Response) -> Response] = []
+        for mw in self.middleware {
+            chain.push(mw)
+        }
+        let mut async_chain: [fn(Ctx, fn(Ctx) -> Future<Response>) -> Future<Response>] = []
+        for mw in self.async_middleware {
+            async_chain.push(mw)
+        }
+        Router {
+            table: self.table,
+            prefix: self.prefix + "/" + prefix,
+            middleware: chain,
+            async_middleware: async_chain,
+            timeout_ms: self.timeout_ms,
+        }
+    }
+
+    /// Installs this router's fallback rendering. Applies to the whole shared
+    /// route storage, not just this group: a 404 has no group to belong to.
+    /// Returns the router itself, so the call chains onto `new()`.
+    ///
+    /// - `fallbacks`: The 404, 405, failure, and timeout renderings this
+    ///   service answers with.
+    fn use_fallbacks(self: Router, fallbacks: Fallbacks) -> Router {
+        installed_fallbacks = [fallbacks]
+        self.table.fallbacks = [fallbacks]
+        self
+    }
+
+    /// Appends an *async* middleware to this group's chain. Only async routes
+    /// see it: a sync onion cannot wrap a leaf that awaits, so the two chains
+    /// are kept apart rather than silently mixed.
+    ///
+    /// - `mw`: Called as `mw(ctx, next)`; it must await `next` to reach the
+    ///   handler.
+    fn use_mw_async(mut self, mw: fn(Ctx, fn(Ctx) -> Future<Response>) -> Future<Response>) {
+        self.async_middleware.push(mw)
+    }
+
+    /// Appends a middleware to this group's chain (first `use`d = outermost).
+    /// Applies to routes registered on this group afterwards.
+    ///
+    /// - `mw`: Called as `mw(ctx, next)`; the first one added is the outermost.
+    fn use_mw(mut self, mw: fn(Ctx, fn(Ctx) -> Response) -> Response) {
+        self.middleware.push(mw)
+    }
+
+    /// Returns a view whose routes carry timeout class `ms` (0 = none),
+    /// enforced by `dispatch_async`.
+    ///
+    /// - `ms`: Timeout class for routes registered on the view; 0 means none.
+    fn with_timeout(self: Router, ms: int) -> Router {
+        Router {
+            table: self.table,
+            prefix: self.prefix,
+            middleware: self.middleware,
+            async_middleware: self.async_middleware,
+            timeout_ms: ms,
+        }
+    }
+
+    /// Synchronous dispatch: match, run the route's middleware onion and
+    /// handler. Timeouts/recovery are `dispatch_async` features.
+    ///
+    /// - `req`: The request to match and answer.
+    fn dispatch(self: Router, req: Request) -> Response {
+        let outcome = resolve(self, req)
+        if outcome.route_index >= 0 {
+            let route = self.table.routes[outcome.route_index]
+            return run_chain(
+                route,
+                0,
+                Ctx {
+                    req: with_body(req),
+                    params: outcome.params,
+                },
+            )
+        }
+        fallback_response(self, req, outcome)
+    }
+
+    /// A `fn(Request) -> Response` closure over this router, pluggable
+    /// straight into `std.http_server.serve`.
+    fn handler(self: Router) -> fn(Request) -> Response {
+        |req| self.dispatch(req)
+    }
+}
+
+/// The request a handler is handed: the one it arrived as, with `body` filled
+/// in.
+///
+/// Draining happens once, here, rather than in each handler. `drained_body` is
+/// a socket read, so a handler that reached for the body twice would get it
+/// once and then an empty string — a bug that only appears in the handlers
+/// that happen to look twice. Filling the field means `ctx.req.body` is the
+/// body, however the request was accepted.
+///
+/// A `multipart/` body is deliberately left unread; those bytes belong to the
+/// route that streams them, and `drained_body` is what knows that.
+///
+/// - `req`: The request as accepted, whose body may still be on the socket.
+fn with_body(req: Request) -> Request {
+    if req.body != "" {
+        return req
+    }
+    // `Request`'s connection fields are private to `std.http_server` (plan
+    // 202), so the re-body clone is that module's to build.
+    std.http_server.with_body(req, drained_body(req))
+}
+
+/// A guard, not a limit any real request approaches: JSON routes take small
+/// documents, and anything genuinely large should be arriving as multipart and
+/// being streamed.
+pub const MAX_DRAINED_BODY_BYTES: int = 33554432
+
+const DRAIN_CHUNK_BYTES: int = 65536
+
+/// The request body as a string, read off the socket if it is still there.
+///
+/// `accept_stream` deliberately leaves the body unread, so an upload route can
+/// pull a multi-gigabyte file in windows rather than materialise it. Every
+/// other route reads `req.body` — so on an `accept_stream` server, something
+/// has to do that read, and without it every `POST` and `PUT` looks to every
+/// handler like it carried nothing. The failure is quiet and confusing: an API
+/// answers "name is required" to a request that supplied a name.
+///
+/// Two cases are left alone, and both are the point. A body already present is
+/// returned untouched (an `accept` server buffered it). A `multipart/` body is
+/// not read at all, because those bytes belong to the route that streams them.
+///
+/// - `req`: The request whose body to read; a `multipart/` body is deliberately
+///   left alone.
+pub fn drained_body(req: Request) -> string {
+    if req.body != "" {
+        return req.body
+    }
+    if std.strings
+        .to_lower(std.http_server.get_header(req, "content-type"))
+        .starts_with("multipart/") {
+        return ""
+    }
+    // A third: a request with no connection behind it, which is what
+    // `detached_request` builds so a route can be dispatched without a socket.
+    // Its body is whatever it was given, and asking for a reader it does not
+    // have is a hard error rather than an empty read.
+    if !is_connected(req) {
+        return ""
+    }
+    let reader = std.http_server.body_reader(req)
+    let mut chunks: [string] = []
+    let mut total = 0
+    while total < MAX_DRAINED_BODY_BYTES {
+        let chunk = std.http_server.read_body(reader, DRAIN_CHUNK_BYTES)
+        if chunk == "" {
+            break
+        }
+        chunks.push(chunk)
+        total = total + chunk.len()
+    }
+    chunks.join("")
+}
+
+/// Whether `req` arrived over a socket this process still holds.
+///
+/// `_handle` is the accepted descriptor, so a real request always has one; a
+/// request built by `detached_request` carries -1 and nothing may be read off
+/// it. Anything reaching for the connection — draining a body, streaming a
+/// response, serving a file — has to ask first.
+///
+/// - `req`: The request to test for a live descriptor.
+pub fn is_connected(req: Request) -> bool {
+    std.http_server.is_connected(req)
+}
+
+/// A `Request` that never came off a socket.
+///
+/// Routing is the half of a service that is worth testing hardest and the half
+/// that needs a live connection least: which route a path picks, what the
+/// params decode to, what the middleware puts on the way out, and what answers
+/// a request nothing matched are all decided before a byte moves. Opening a
+/// listener to ask those questions makes the suite slow, flaky and unable to
+/// run two cases at once, so this builds the request instead.
+///
+/// `target` is the raw request target, query string included, exactly as a
+/// client would have sent it. `headers` is the `\n`-joined block, and `body` is
+/// the body the handler will see — a detached request has no socket to drain
+/// one from, so what is passed here is all there is. A route that streams
+/// (`serve_file`, `respond_stream`) still needs a real connection; `dispatch`
+/// and `dispatch_async` do not.
+///
+/// - `method`: HTTP method, uppercase.
+/// - `target`: Raw request target, query string included.
+/// - `headers`: Header block joined with newlines.
+/// - `body`: Body the handler will see; there is no socket to drain one from.
+pub fn detached_request(method: string, target: string, headers: string, body: string) -> Request {
+    std.http_server.detached_request(method, target, headers, body)
+}
+
+/// The sentinel a streaming handler returns after responding through the raw
+/// request (`respond_stream`/`serve_file`): accept-loop servers must skip
+/// `respond` for it.
+pub fn responded() -> Response {
+    Response {
+        status: -1,
+        body: "",
+        headers: "",
+        url: "",
+    }
+}
+
+/// Whether `response` is the already-responded sentinel.
+///
+/// - `response`: The value a handler returned.
+pub fn is_responded(response: Response) -> bool {
+    response.status < 0
+}
+
+/// Zero or one: a responder consulted for every OPTIONS request *before*
+/// matching. Empty is this package's existing behaviour, where a preflight
+/// runs the matched node's middleware chain exactly as chi's does.
+let mut preflight: [fn(Request) -> Response] = []
+
+/// Answers every OPTIONS request from `responder`, ahead of route matching.
+///
+/// The gap it closes: a preflight to a path no route claims matches nothing,
+/// so there is no captured middleware chain to run and no CORS middleware can
+/// fire — the browser reads a 404 and refuses the real request that would have
+/// followed. A path claimed only under another verb has the same problem with
+/// a 405. Neither is a routing question; both are answered by the CORS rules
+/// alone, which is why the answer belongs ahead of `resolve`.
+///
+/// Process-wide rather than per-`Router`, like `envelope.use_error_body`: a
+/// preflight policy is a property of the service that is listening, and the
+/// alternative is threading it through every group handle. `middleware.cors_async`
+/// installs it from `CorsOptions.preflight_unmatched`; a service with a
+/// different rule can install its own.
+///
+/// - `responder`: Answers every OPTIONS request, ahead of route matching.
+pub fn use_preflight(responder: fn(Request) -> Response) {
+    preflight = [responder]
+}
+
+/// Restores matched-chain preflight handling.
+pub fn clear_preflight() {
+    preflight = []
+}
+
+/// The most recently installed `Fallbacks`, for the renderings a handler has
+/// to reach without a `Router` in hand.
+///
+/// A `Router` handle is passed to `dispatch_async`, not to a handler, so a
+/// streaming route that finds no file on disk has nothing to ask what this
+/// service's 404 looks like. Recorded here by `use_fallbacks`, which already
+/// applies to the whole shared route storage rather than to one group.
+let mut installed_fallbacks: [Fallbacks] = []
+
+/// This service's not-found rendering for `ctx`, or the package envelope when
+/// no application installed one.
+///
+/// `files.serve` is the caller that matters: a file route that answers 404
+/// should answer it in the shape every other route does, and the plain-text
+/// body `std.http_server.serve_file` writes for an unopenable path is nobody's
+/// wire contract.
+///
+/// - `ctx`: The request context the 404 is rendered for.
+pub fn not_found_for(ctx: Ctx) -> Response {
+    if installed_fallbacks.len() > 0 {
+        let render = installed_fallbacks[0].not_found
+        return render(ctx)
+    }
+    envelope.app_error(404, "not_found", "no such route", "")
+}
+
+/// Forgets the recorded fallbacks; the package envelope answers again.
+pub fn clear_fallbacks() {
+    installed_fallbacks = []
+}
+
+struct MatchOutcome {
+    route_index: int,
+    node_index: int,
+    params: {string: string},
+}
+
+/// Result of `Router.find`: `status` is 200 (route matched — `pattern` and
+/// `params` describe it), 405 (`allow` lists the methods), or 404.
+pub struct FindResult {
+    /// 200 when a route matched, 405 when only the method was wrong, 404
+    /// otherwise.
+    status: int,
+    /// The pattern that matched, for a 200.
+    pattern: string,
+    /// The parameters that pattern bound.
+    params: {string: string},
+    /// The `Allow` header value, for a 405.
+    allow: string,
+}
+
+impl Router {
+    /// Matches `method path` without dispatching — the testable core of the
+    /// routing semantics.
+    ///
+    /// - `method`: HTTP method to match, uppercase.
+    /// - `path`: Request path, without a query string.
+    fn find(self: Router, method: string, path: string) -> FindResult {
+        let raw_path = path_of(path)
+        let mut params: {string: string} = {:}
+        let node = match_node(
+            self.table.nodes,
+            0,
+            split_segments(raw_path),
+            0,
+            &mut params,
+        )
+        if node < 0 {
+            return FindResult {
+                status: 404,
+                pattern: "",
+                params: params,
+                allow: "",
+            }
+        }
+        let matched = method_index(self.table.nodes[node], method)
+        if matched >= 0 {
+            let route = self.table.routes[matched]
+            return FindResult {
+                status: 200,
+                pattern: route.pattern,
+                params: params,
+                allow: "",
+            }
+        }
+        FindResult {
+            status: 405,
+            pattern: "",
+            params: params,
+            allow: allow_list(self, node),
+        }
+    }
+
+    /// Every registered `METHOD pattern` pair, sorted.
+    ///
+    /// The surface a contract test compares against a recorded expectation, so a
+    /// route silently added, removed or renamed fails the build rather than a
+    /// client. `find` answers what *one* request resolves to; this answers what
+    /// the router accepts at all, which is the question a contract asks.
+    fn surface(self: Router) -> [string] {
+        let mut out: [string] = []
+        for route in self.table.routes {
+            out.push(route.method + " " + route.pattern)
+        }
+        out.sort()
+        out
+    }
+}
+
+fn allow_list(r: Router, node: int) -> string {
+    let mut allow = ""
+    for method in r.table.nodes[node].methods {
+        if allow != "" {
+            allow = allow + ", "
+        }
+        allow = allow + method
+    }
+    allow
+}
+
+/// Recursive trie descent with chi precedence: literal beats param beats
+/// wildcard, with backtracking when a deeper literal path dead-ends.
+///
+/// - `nodes`: The trie arena.
+/// - `node`: Index of the node being descended from.
+/// - `segments`: The path split into segments.
+/// - `index`: Index of the segment under consideration.
+/// - `params`: Accumulator the bound parameters are written into.
+fn match_node(
+    nodes: [TrieNode],
+    node: int,
+    segments: [string],
+    index: int,
+    params: &mut {string: string},
+) -> int {
+    if index >= segments.len() {
+        if nodes[node].methods.len() > 0 {
+            return node
+        }
+        // An empty tail still matches a wildcard child holding routes.
+        let wild = nodes[node].wild_child
+        if wild >= 0 && nodes[wild].methods.len() > 0 {
+            params[nodes[node].wild_name] = ""
+            return wild
+        }
+        return -1
+    }
+    let seg = segments[index]
+    if nodes[node].children.has(seg) {
+        let found = match_node(
+            nodes,
+            nodes[node].children[seg],
+            segments,
+            index + 1,
+            params,
+        )
+        if found >= 0 {
+            return found
+        }
+    }
+    let param = nodes[node].param_child
+    if param >= 0 {
+        params[nodes[node].param_name] = url_decode(seg)
+        let found = match_node(nodes, param, segments, index + 1, params)
+        if found >= 0 {
+            return found
+        }
+        params.remove(nodes[node].param_name)
+    }
+    let wild = nodes[node].wild_child
+    if wild >= 0 && nodes[wild].methods.len() > 0 {
+        let mut rest = segments[index]
+        let mut j = index + 1
+        while j < segments.len() {
+            rest = rest + "/" + segments[j]
+            j = j + 1
+        }
+        params[nodes[node].wild_name] = url_decode(rest)
+        return wild
+    }
+    -1
+}
+
+/// The route index registered at `node` for `method`, or -1.
+///
+/// A HEAD with no HEAD route of its own runs the GET one. That is what a HEAD
+/// *is* — RFC 9110 defines it as GET without the body — and it is the rule
+/// almost everything follows: Go 1.22's `ServeMux` matches HEAD against a
+/// `GET` pattern, axum's `get()` routes GET and HEAD, Express falls a HEAD
+/// through to the GET handler, Werkzeug adds HEAD to every GET rule, and
+/// Django's `View` aliases `head` to `get`. (chi, whose precedence rules this
+/// package otherwise follows, is the outlier.)
+///
+/// Nothing has to write the response differently: `std.http_server` suppresses
+/// the body of a HEAD response at the connection, exactly as Go's
+/// `ResponseWriter` does, and `serve_file` answers a HEAD with the headers and
+/// no bytes. A route registered for HEAD explicitly still wins.
+///
+/// - `node`: The matched trie node.
+/// - `method`: HTTP method to look up; HEAD falls through to GET.
+fn method_index(node: TrieNode, method: string) -> int {
+    if node.methods.has(method) {
+        return node.methods[method]
+    }
+    if method == "HEAD" && node.methods.has("GET") {
+        return node.methods["GET"]
+    }
+    -1
+}
+
+fn resolve(r: Router, req: Request) -> MatchOutcome {
+    let raw_path = path_of(req.path)
+    let mut params: {string: string} = {:}
+    let node = match_node(r.table.nodes, 0, split_segments(raw_path), 0, &mut params)
+    if node < 0 {
+        return MatchOutcome {
+            route_index: -1,
+            node_index: -1,
+            params: params,
+        }
+    }
+    let matched = method_index(r.table.nodes[node], req.method)
+    if matched >= 0 {
+        return MatchOutcome {
+            route_index: matched,
+            node_index: node,
+            params: params,
+        }
+    }
+    MatchOutcome {
+        route_index: -1,
+        node_index: node,
+        params: params,
+    }
+}
+
+/// Runs `route`'s middleware onion from `index`, bottoming out in the handler.
+///
+/// - `route`: The matched route, carrying its captured onion.
+/// - `index`: Position in the chain to run from.
+/// - `ctx`: The request context passed down the onion.
+fn run_chain(route: Route, index: int, ctx: Ctx) -> Response {
+    if index >= route.middleware.len() {
+        let handler = route.handler
+        return handler(ctx)
+    }
+    let mw = route.middleware[index]
+    mw(ctx, |c| run_chain(route, index + 1, c))
+}
+
+/// 404/405 handling. A method-miss (including OPTIONS preflight) runs the
+/// node's middleware chain — borrowed from the first registered route on the
+/// node — with the 405 as the leaf, so cors/logging still observe it.
+///
+/// - `r`: The router that failed to match.
+/// - `req`: The request being answered.
+/// - `outcome`: What the match found: the node reached and why it did not
+///   resolve.
+fn fallback_response(r: Router, req: Request, outcome: MatchOutcome) -> Response {
+    let ctx = Ctx {
+        req: req,
+        params: outcome.params,
+    }
+    if outcome.node_index < 0 {
+        if r.table.fallbacks.len() > 0 {
+            let render = r.table.fallbacks[0].not_found
+            return render(ctx)
+        }
+        return envelope.app_error(404, "not_found", "no such route", "")
+    }
+    let allow = allow_list(r, outcome.node_index)
+    let mut first_route = -1
+    for method in r.table.nodes[outcome.node_index].methods {
+        if first_route < 0 {
+            first_route = r.table.nodes[outcome.node_index].methods[method]
+        }
+    }
+    let miss = if r.table.fallbacks.len() > 0 {
+        let render = r.table.fallbacks[0].method_not_allowed
+        render(ctx, allow)
+    } else {
+        Response {
+            status: 405,
+            body: "{\"error\":{\"message\":\"method not allowed\",\"code\":\"method_not_allowed\",\"status_code\":405}}",
+            headers: "Content-Type: application/json\nAllow: " + allow,
+            url: "",
+        }
+    }
+    if first_route < 0 {
+        return miss
+    }
+    let route = r.table.routes[first_route]
+    run_miss_chain(route, 0, ctx, miss)
+}
+
+fn run_miss_chain(route: Route, index: int, ctx: Ctx, miss: Response) -> Response {
+    if index >= route.middleware.len() {
+        return miss
+    }
+    let mw = route.middleware[index]
+    mw(ctx, |c| run_miss_chain(route, index + 1, c, miss))
+}
+
+/// Runs a route's chain inside a scheduler task so `dispatch_async` can race
+/// it against a timeout and catch failures.
+/// A synchronous placeholder for an async route's handler slot. Reaching it
+/// means `dispatch` was handed a route only `dispatch_async` can run, which is
+/// a wiring mistake rather than a request problem — so it is a 500 naming
+/// itself, not a 404 the caller would chase in the route table.
+fn unreachable_sync() -> Response {
+    envelope.app_error(500, "internal", "this route needs dispatch_async", "")
+}
+
+async fn run_async_chain(route: Route, index: int, ctx: Ctx) -> Response {
+    if index >= route.async_middleware.len() {
+        let handler = route.async_handler[0]
+        return await handler(ctx)
+    }
+    let mw = route.async_middleware[index]
+    await mw(ctx, |c| run_async_chain(route, index + 1, c))
+}
+
+async fn run_route(route: Route, ctx: Ctx) -> Response {
+    if route.async_handler.len() > 0 {
+        return await run_async_chain(route, 0, ctx)
+    }
+    run_chain(route, 0, ctx)
+}
+
+/// Async dispatch for accept-loop servers: the sync semantics plus per-group
+/// timeouts (a 503 envelope once the route's timeout class expires; the
+/// handler's task is cancelled and its cleanup awaited). A handler that hits a
+/// checked programming bug ends the process, as every Moon program does, so
+/// there is no recovery path here.
+///
+/// - `r`: The router to match against.
+/// - `req`: The request to answer.
+pub async fn dispatch_async(r: Router, req: Request) -> Response {
+    if preflight.len() > 0 && req.method == "OPTIONS" {
+        let answer = preflight[0]
+        return answer(req)
+    }
+    let outcome = resolve(r, req)
+    if outcome.route_index < 0 {
+        return fallback_response(r, req, outcome)
+    }
+    let route = r.table.routes[outcome.route_index]
+    let ctx = Ctx {
+        req: with_body(req),
+        params: outcome.params,
+    }
+    let work = run_route(route, ctx)
+    if route.timeout_ms > 0 {
+        match await futures.timeout(work, std.time.ms(route.timeout_ms)) {
+            ok(response) => {
+                return response
+            },
+            err(_) => {
+                std.log.warn_with(
+                    "request timed out",
+                    {
+                        "method": std.json.to_string(std.json.Json.Str(req.method)),
+                        "path": std.json.to_string(std.json.Json.Str(req.path)),
+                        "timeout_ms": std.json.to_string(std.json.Json.Int(route.timeout_ms)),
+                    },
+                )
+                if r.table.fallbacks.len() > 0 {
+                    let render = r.table.fallbacks[0].timed_out
+                    return render(ctx, route.timeout_ms)
+                }
+                return envelope.app_error(503, "timeout", "request timed out", "")
+            },
+        }
+    }
+    await work
+}

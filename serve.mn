@@ -1,0 +1,171 @@
+// moon_router.serve — a streaming accept loop that can be told to stop.
+//
+// `std.http_server.serve` is the right thing for a service whose handlers take
+// a whole request and return a whole response. A service that streams is not
+// that service: a file route has to answer on the socket itself, because a
+// `Response` value carries its whole body and a multi-gigabyte video cannot be
+// one. So the loop is `accept_stream` and the handler is handed the raw
+// request.
+//
+// The other half is stopping. A listener parked in `accept` with no client is
+// waiting for something that may never arrive, so it cannot be asked to finish
+// — only cancelled. `serve_with_shutdown` is that pair written once: accept in
+// a spawned task, wait for a signal, cancel the acceptor, close the listener,
+// then give the caller its own drain a deadline. Getting the order wrong is
+// how a shutdown either hangs or drops connections it had already accepted.
+//
+// It lives beside the dispatch it feeds and imports none of it: a
+// consumer that wants the loop and not the trie pays for nothing, and a
+// consumer that wants both writes the four lines between them itself —
+// `dispatch_async`, then `respond` unless the answer was `responded()`.
+
+use std.futures
+use std.http_server
+
+use std.http_server.Request
+use std.os
+
+/// How long a shutdown waits for in-flight work before giving up on it.
+pub const DEFAULT_DRAIN_MS: int = 30000
+
+/// The signals a service stops on. Ctrl-C and the one an orchestrator sends.
+pub const STOP_SIGNALS: [string] = ["int", "term"]
+
+/// One connection at a time, each served on its own task.
+///
+/// Never returns on its own: the caller cancels it. That is not a shortcut —
+/// there is no other way to leave an `accept` that no client will complete.
+///
+/// - `listener`: Listener handle to accept on.
+/// - `serve_one`: Called with each accepted request, on a task of its own.
+pub async fn accept_loop(listener: int, serve_one: fn(Request) -> Future<int>) -> int {
+    while true {
+        let native = http_server.accept_stream(listener)
+        let _ = serve_request(native, serve_one)
+    }
+    0
+}
+
+/// One request on one task.
+async fn serve_request(native: Request, serve_one: fn(Request) -> Future<int>) -> int {
+    await serve_one(native)
+}
+
+/// Blocks until the process is asked to stop, and answers which signal did it.
+pub async fn wait_for_stop() -> string {
+    let signals = os.signals(STOP_SIGNALS).unwrap()
+    let name = await signals.next()
+    signals.close()
+    name
+}
+
+/// The drain, reported as finished once it completes. The drain is started
+/// here rather than handed in as a future, so that it is this task's child:
+/// when the budget or a second stop wins the race, cancelling this task
+/// cancels the drain with it instead of leaving it running under
+/// `serve_with_shutdown`, whose return would then wait for it anyway.
+async fn drained(drain: fn() -> Future<int>) -> bool {
+    let _ = await drain()
+    true
+}
+
+/// The drain budget, reported as a drain that did not finish in time.
+async fn expired(ms: int) -> bool {
+    await futures.sleep(std.time.ms(ms))
+    false
+}
+
+/// A second stop signal, reported as a drain that was abandoned.
+async fn stopped(signals: os.Signals) -> bool {
+    let _ = await signals.next()
+    false
+}
+
+/// Serve until a stop signal arrives, then shut down in the one order that
+/// works.
+///
+/// Accept in a spawned task; wait; *cancel* the acceptor before closing the
+/// listener, since a parked accept cannot notice a closed socket it is already
+/// inside; close the listener so nothing new is taken; then run the caller's
+/// `drain` against `drain_ms`. Answers true if the drain finished inside its
+/// deadline, false if the deadline won — a caller that wants to exit non-zero
+/// on a hung shutdown has the answer rather than having to time it itself.
+/// A second stop signal also returns false. Waiting for that signal keeps the
+/// default hybrid clock paced during the drain, including when its work is
+/// blocked in native I/O. An explicitly pinned virtual clock stays virtual.
+///
+/// `idle_timeout_ms` is how long a finished keep-alive connection may sit in
+/// the pool before the server closes it; 0 keeps `std.http_server`'s 60 s
+/// default, the same way `drain_ms` of 0 keeps `DEFAULT_DRAIN_MS`. A service
+/// behind a proxy that holds connections open longer than this will reconnect
+/// more often than it needs to, and one that never times them out accumulates
+/// descriptors for clients that walked away.
+///
+/// - `listener`: Listener handle to accept on.
+/// - `serve_one`: Called with each accepted request, on a task of its own.
+/// - `drain`: Run after the listener closes, to finish in-flight work.
+/// - `drain_ms`: How long the drain may take; 0 keeps `DEFAULT_DRAIN_MS`.
+/// - `idle_timeout_ms`: How long an idle keep-alive connection may sit in the
+///   pool; 0 keeps `std.http_server`'s 60 s default.
+///
+/// ```moon
+/// use moon_router.router
+/// use moon_router.serve
+/// use moon_router.router.Router
+/// use std.http.Response
+/// use std.http_server.Request
+///
+/// async fn serve_one(app: Router, request: Request) -> int {
+///   let response = await router.dispatch_async(app, request)
+///   if !router.is_responded(response) {
+///     std.http_server.respond(request, response)
+///   }
+///   0
+/// }
+///
+/// async fn drain() -> int { 0 }
+///
+/// async fn main() {
+///   let app = router.new()
+///   app.get("/health", |_ctx| std.http_server.text(200, "ok"))
+///   let listener = std.http_server.listen("127.0.0.1", 8080)
+///   println(await serve.serve_with_shutdown(
+///     listener,
+///     |request| serve_one(app, request),
+///     drain,
+///     serve.DEFAULT_DRAIN_MS,
+///     60_000,
+///   ))
+/// }
+/// ```
+pub async fn serve_with_shutdown(
+    listener: int,
+    serve_one: fn(Request) -> Future<int>,
+    drain: fn() -> Future<int>,
+    drain_ms: int,
+    idle_timeout_ms: int,
+) -> bool {
+    if idle_timeout_ms > 0 {
+        let _ = http_server.set_idle_timeout(listener, idle_timeout_ms)
+    }
+    let signals = os.signals(STOP_SIGNALS).unwrap()
+    defer signals.close()
+    let accepting: futures.Group<int> = futures.group()
+    accepting.spawn(accept_loop(listener, serve_one))
+    let _ = await signals.next()
+    // The cancel is a request; closing the listener is what ends the accept.
+    accepting.cancel()
+    let _ = http_server.close(listener)
+    let budget = if drain_ms > 0 {
+        drain_ms
+    } else {
+        DEFAULT_DRAIN_MS
+    }
+    // After the acceptor stops, this is the remaining outside-world wait: the
+    // drain, the budget, or a second stop, whichever comes first. `race`
+    // cancels the two that lost and waits for their cleanup.
+    await futures.race(
+        drained(drain),
+        futures.race(expired(budget), stopped(signals)),
+    )
+}
