@@ -144,7 +144,7 @@ the server's internals to a client. A validation error names its field through
 moon has no user-constructible error payload — and `split_field` takes it out
 again.
 
-### A body shape of the service's own
+### A body shape the service defines
 
 A port has to match the bytes of the thing it replaced, and those are rarely
 this package's nested shape:
@@ -209,7 +209,7 @@ r.get_stream("videos/{id}/stream", |ctx| files.serve(ctx, path_for(ctx.param("id
 
 `files.serve` writes the file through `std.http_server.serve_file` — `HEAD`,
 `Accept-Ranges`, one `Range`, `If-Range`, 206 slices and 416 — and returns
-`router.responded()`. A missing file renders through the application's own
+`router.responded()`. A missing file renders through the application's
 not-found rather than `serve_file`'s plain-text 404, so a client cannot tell
 file routes apart by the shape of a miss. Also in the module:
 `files.content_type_for(path)` (an extension table), `files.serve_path` (the

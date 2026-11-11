@@ -314,7 +314,7 @@ pub class RouteTable {
     routes: [Route],
     /// The matching trie arena; node 0 is the root.
     nodes: [TrieNode],
-    /// Zero or one, like a route's async handler: the application's own
+    /// Zero or one, like a route's async handler: the application's
     /// fallback rendering, or this package's envelope.
     fallbacks: [Fallbacks],
 }
@@ -672,7 +672,7 @@ impl Router {
     /// so later `use` calls on either side do not leak across.
     ///
     /// - `prefix`: Path prefix every route of the group hangs under, joined
-    ///   onto this router's own.
+    ///   onto this router's prefix.
     fn group(self: Router, prefix: string) -> Router {
         let mut chain: [fn(Ctx, fn(Ctx) -> Response) -> Response] = []
         for mw in self.middleware {

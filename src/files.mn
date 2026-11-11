@@ -96,7 +96,7 @@ pub fn range_start(req: Request, size: long) -> long {
 
 /// Serves `path` on the socket and answers `router.responded()`.
 ///
-/// A missing file goes through the application's own not-found rendering
+/// A missing file goes through the application's not-found rendering
 /// rather than the plain-text 404 `serve_file` writes for an unopenable path:
 /// a service whose 404 is an envelope should answer file routes the same way,
 /// and a client cannot tell which route it asked for from the shape of the
